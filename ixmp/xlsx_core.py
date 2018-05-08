@@ -31,14 +31,42 @@ def apply_filters(df, filters={}):
 
 
 class init_model(object):
+    """ Class 'init_model' contains all functions required to create a model.
+    Includes functions to:
+    1. Read input data
+    2. Create scenario in the local database
+    3. Add scenario metadata as well as basic set definitions
+    4. Add demand data
+    5. Add fossil resource data
+    6. Add renewable resource data
+    7. Add technology parameters
+    8. Add relative soft constraints
+    9. Add incovenience costs as generic relations
+    10. Add final energy market penetrations while taking into account demand trajectories
+    """
 
     def __init__(self, mp, filin, verbose, disp_error):
+        """Initialize a new Python-class init_model
+
+        Parameters
+        ----------
+        mp : Python-class 
+            ixmp.Platform
+        filin : string
+            the name of the xlsx file (<file name>.xlsx) containg the model.scenario data
+        verbose : boolean
+            shows input data upon model creation 
+        disp-error : boolean
+            displays extended error reporting
+        """
         self.mp = mp
         self.filin = filin
         self.verbose = verbose
         self.disp_error = disp_error
 
     def read_input(self):
+        """ Read xlsx input file
+        """
         xlsx = pd.ExcelFile(self.filin)
         self.meta = xlsx.parse('metadata', index_col=0)
         self.tecs = xlsx.parse('technologies')
@@ -49,6 +77,8 @@ class init_model(object):
         return(self.meta, self.tecs, self.dems, self.resources, self.mpa_data)
 
     def create_scen(self):
+        """ Creates scenario
+        """
         # Creates a new data structure based on model and scenario name
         model_nm = self.meta.loc['Model Name', 'Value']
         scen_nm = self.meta.loc['Scenario Name', 'Value']
@@ -59,6 +89,20 @@ class init_model(object):
         return(self.scenario, model_nm, scen_nm)
 
     def add_metadata(self):
+        """ Adds scenario metadata and introduces model structure (levels, commodities grades etc.)
+        1. Adds 'year'
+        2. Adds 'firstmodelyear'
+        3. Adds 'interestrate' 
+        4. Adds regions and spatial mapping
+        5. Adds 'mode'
+        6. Adds 'units'
+        7. Adds 'level'
+        8. Adds all relevant sets for intermittent renewables using renewable resources
+        9. Adds 'grade'
+        10. Adds 'commodity'
+        11. Adds 'technology'
+        12. Adds 'emission'       
+        """
         # Define the time periods included in the model
         self.horizon = [
             d for d in self.tecs.columns[self.tecs.columns.str.startswith(('1', '2'))]]
@@ -149,23 +193,36 @@ class init_model(object):
 
         # Add emission species
         self.scenario.add_set(
-            'emission', self.tecs['Species'].unique().tolist())
+            'emission', self.tecs['Species'].dropna().unique().tolist())
         print('Scenario emission species are:\n', self.scenario.set(
             "emission"), '\n') if self.verbose == True else 0
 
         return(self.horizon, self.vintage_years, self.firstyear)
 
     def demand_input_data(self, ap):
-        # Add demands
+        """ Adds data for demands to scenario
+
+        Parameter
+        ---------
+
+        ap: add_par class 
+            contains all functions necessary to add data
+        """
         ap.add_dem(self.dems)
         print('Scenario demands are:\n', self.scenario.par(
             "demand"), '\n') if self.verbose == True else 0
 
     def fossil_resource_input_data(self, ap):
-        # Add resources
+        """ Adds data for fossil resources to scenario
+
+        Parameter
+        ---------
+
+        ap: add_par class 
+            contains all functions necessary to add data
+        """
         rvol = apply_filters(self.resources, filters={
                              'Parameter': 'resource_volume'}).dropna(axis=1, how='all')
-        # Renames the last column to 'value'
         rvol = rvol.rename(columns={rvol.columns[-1]: 'value'})
         ap.add_res_volume(rvol)
         print('Scenario resource volumes are:\n', self.scenario.par(
@@ -178,6 +235,24 @@ class init_model(object):
             "resource_remaining"), '\n') if self.verbose == True else 0
 
     def renewable_resource_input_data(self, ap):
+        """ Function covers all necessary steps to add renewable resources
+
+        Parameter
+        ---------
+
+        ap: add_par class 
+            contains all functions necessary to add data
+
+        Steps as follows:
+        1. Updates 'type_tec' to include all intermittent renewable technologies.
+        2. Adds 'flexibility_factor'
+        3. Adds 'rating_bin' size
+        4. Adds 'reliability_factor' for different bins
+        5. Adds 'peak_load_factor'
+        6. Adds 'renewable_potential'
+        7. Adds 'renewable_capacity_factor' for the various potentials
+        """
+
         # Define which technologies are "intermittent renewables"
         self.scenario.add_set('type_tec', ["renewable"])
         ren_tec = apply_filters(self.tecs, filters={'Level': 'renewable'})[
@@ -188,30 +263,23 @@ class init_model(object):
         self.scenario.add_set('cat_tec', cat_tec)
 
         # Define the flexibility for various powerplants
-        # All factors are set based on Sullivan, Impacts of considering electric sector variability and reliability in the
-        # MESSAGE model, Energy strategy reviews, 2013
         ap.add_tec_flex(apply_filters(self.tecs, filters={
                         'Parameter': 'flexibility_factor'}))
         print(self.scenario.par("flexibility_factor")
               ) if self.verbose == True else 0
 
         # Adds the "bin" size for technologies
-        # For intermittent renewable electricity generation technolgies, the size is set according to parameters in Sullivan, 2013
-        # All other electricity generation technologies have a factor of 1
         ap.add_bin_size(apply_filters(
             self.tecs, filters={'Parameter': 'rating_bin'}))
         print(self.scenario.par("rating_bin")) if self.verbose == True else 0
 
         # Adds the "bin" reliability factor
-        # For intermittent renewable electricity generation technologies the factor is set according to parameters in Sullivan, 2013
-        # All other electricity generation technologies have a factor of 1
         ap.add_bin_reliability(apply_filters(self.tecs, filters={
                                'Parameter': 'reliability_factor'}))
         print(self.scenario.par("reliability_factor")
               ) if self.verbose == True else 0
 
-        # Adds peak load factor (this is the relation between peak and base load)
-        # This results in an increase in installed capacity of power plants)
+        # Adds peak load factor
         ap.add_peak_load(apply_filters(self.tecs, filters={
                          'Parameter': 'peak_load_factor'}))
         print(self.scenario.par('peak_load_factor')
@@ -234,7 +302,40 @@ class init_model(object):
         print(self.scenario.par('renewable_capacity_factor')
               ) if self.verbose == True else 0
 
-    def technology_input_data(self, ap):
+    def technology_parameters(self, ap):
+        """ Function covers all necessary steps to add renewable resources
+
+        Parameter
+        ---------
+
+        ap: add_par class 
+            contains all functions necessary to add data
+
+        Steps as follows, adding:
+        1. input (AT)
+        2. output (AT)
+        3. inv_cost (AT)
+        4. var_cost (AT)
+        5. fix_cost (AT)
+        6. capacity factor (AT)
+        7. technical_lifetime (AT)
+        8. initial_new_capacity_up (currently excluded)
+        9. growth_new_capacity_up (currently excluded)
+        10. bound_new_capacity_up (AT)
+        11. bound_new_capacity_lo (currently excluded)
+        12. bound_total_capacity_up (currently excluded)
+        13. bound_total_capacity_lo (currently excluded)
+        14. initial_activity_up (AT)
+        15. growth_activity_up (AT)
+        16. initial_activity_lo (currently excluded)
+        17. growth_activity_lo (currently excluded)
+        18. bound_activity_lo (AT)   
+        19. bound_activity_up (AT)
+        20. historic_capacity (currently excluded)
+        21. emission_factor (AT)
+
+        """
+
         # Adds input level, commodity and efficiency for all technologies
         ap.add_tec_input(apply_filters(
             self.tecs, filters={'Parameter': 'input'}))
@@ -267,7 +368,7 @@ class init_model(object):
 
         # Adds capacity factors for all technologies
         ap.add_tec_plf(apply_filters(self.tecs, filters={
-                       'Parameter': 'capacity factor'}))
+                       'Parameter': 'capacity_factor'}))
         print('Scenario capacity factors for technologies are:\n', self.scenario.par(
             "capacity_factor"), '\n') if self.verbose == True else 0
 
@@ -362,6 +463,25 @@ class init_model(object):
             'emission_factor'), '\n') if self.verbose == True else 0
 
     def rel_soft_constraints(self, mpalo=None, mpaup=None, mpclo=None, mpcup=None):
+        """ Adds relative soft constraints"
+
+        Parameter
+        ---------
+
+        mpalo : list
+            parameters for adding soft_growth_activity_lo to all technologies with growth_activity_lo
+            [<% relaxation>,<% of LCOE>]
+        mpaup : list
+            parameters for adding soft_growth_activity_up to all technologies with growth_activity_up
+            [<% relaxation>,<% of LCOE>]
+        mpclo : list
+            parameters for adding soft_growth_new_capacity_lo to all technologies with growth_new_capacity_lo
+            [<% relaxation>,<% of LCOE>]
+        mpcup : list
+            parameters for adding soft_growth_new_capacity_up to all technologies with growth_new_capacity_up
+            [<% relaxation>,<% of LCOE>]
+        """
+
         # Add soft_growth_activity_lo
         if mpalo:
             for n in mpalo:
@@ -426,6 +546,8 @@ class init_model(object):
                                   relcostsoftmpcup)
 
     def inconvenience_costs(self):
+        """ Adds invonvenience costs in the form of a generic relation
+        """
         acty = [y for y in self.horizon if int(y) >= self.firstyear]
         inconvc = apply_filters(
             self.tecs, filters={'Parameter': 'inconv_cost'})
@@ -466,6 +588,15 @@ class init_model(object):
             self.scenario.add_par("relation_activity", par)
 
     def final_energy_mpa(self, mpa_gen):
+        """ Adds lower/upper market pentrations constraints
+
+        Parameters
+        ----------
+
+        mpa_gen : boolean/integer
+            if set to False, no market pentration constraints will be added, otherwise
+            the integer provided specifies the year as of which the constraints are added.
+        """
         # Checks whether the year defined for the generation of the mpas is defined
         assert str(mpa_gen) in self.scenario.set(
             'year').values, 'Year as of which mpas should be generated is not defined as a year in the model'
@@ -633,6 +764,20 @@ class init_model(object):
 class add_par(object):
 
     def __init__(self, scenario, horizon, vintage_years, firstyear, disp_error):
+        """ Initialize Python-class add_par
+
+        Parameters
+        ----------
+        scenario : ixmp.Sceanrio
+        horizon : list
+            model years
+        vintage_years : list
+            vintage years and corresponding activity years 
+        firstyear : integer
+            first model year
+        disp-error : boolean
+            displays extended error reporting
+        """
         self.scenario = scenario
         self.horizon = horizon
         self.vintage_years = vintage_years
