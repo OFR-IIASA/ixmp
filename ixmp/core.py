@@ -1,15 +1,17 @@
 # coding=utf-8
 import os
 import sys
+from pathlib import Path
+from subprocess import check_call
 import warnings
-import jpype
 
+import jpype
+from jpype import (
+    JClass,
+    JPackage as java,
+)
 import numpy as np
 import pandas as pd
-
-from jpype import JPackage as java
-from jpype import JClass
-from subprocess import check_call
 
 import ixmp as ix
 from ixmp import model_settings
@@ -21,33 +23,53 @@ from ixmp.utils import logger, islistable, check_year, harmonize_path
 IAMC_IDX = ['model', 'scenario', 'region', 'variable', 'unit']
 
 
-# %% Java Virtual Machine start-up
-
 def start_jvm(jvmargs=None):
+    """Start the Java Virtual Machine via JPype.
+
+    Parameters
+    ----------
+    jvmargs : str or list of str, optional
+        Additional arguments to pass to :meth:`jpype.startJVM`.
+    """
+    # TODO change the jvmargs default to [] instead of None
     if jpype.isJVMStarted():
         return
 
-    module_root = os.path.dirname(__file__)
-    jarfile = os.path.join(module_root, 'ixmp.jar')
-    module_lib = os.path.join(module_root, 'lib')
-    module_jars = [os.path.join(module_lib, f) for f in os.listdir(module_lib)]
+    jvmargs = jvmargs or []
+
+    # Arguments
+    args = [jpype.getDefaultJVMPath()]
+
+    # Add the ixmp root directory, ixmp.jar and bundled .jar and .dll files to
+    # the classpath
+    module_root = Path(__file__).parent
+    jarfile = module_root / 'ixmp.jar'
+    module_jars = list(module_root.glob('lib/*'))
+    classpath = map(str, [module_root, jarfile] + list(module_jars))
+
     sep = ';' if os.name == 'nt' else ':'
-    classpath = sep.join([module_root, jarfile] + module_jars)
-    args = ["-Djava.class.path={}".format(classpath)]
-    if jvmargs is not None:
-        args += jvmargs if isinstance(jvmargs, list) else [jvmargs]
-    jpype.startJVM(jpype.getDefaultJVMPath(), *args)
+    args.append('-Djava.class.path={}'.format(sep.join(classpath)))
+
+    # Add user args
+    args.extend(jvmargs if isinstance(jvmargs, list) else [jvmargs])
+
+    # For JPype 0.7 (raises a warning) and 0.8 (default is False).
+    # 'True' causes Java string objects to be converted automatically to Python
+    # str(), as expected by ixmp Python code.
+    kwargs = dict(convertStrings=True)
+
+    jpype.startJVM(*args, **kwargs)
 
     # define auxiliary references to Java classes
-    java.ixmp = java("at.ac.iiasa.ixmp")
-    java.Integer = java("java.lang").Integer
-    java.Double = java("java.lang").Double
-    java.LinkedList = java("java.util").LinkedList
-    java.HashMap = java("java.util").HashMap
-    java.LinkedHashMap = java("java.util").LinkedHashMap
+    java.ixmp = java('at.ac.iiasa.ixmp')
+    java.Integer = java('java.lang').Integer
+    java.Double = java('java.lang').Double
+    java.LinkedList = java('java.util').LinkedList
+    java.HashMap = java('java.util').HashMap
+    java.LinkedHashMap = java('java.util').LinkedHashMap
 
 
-class Platform(object):
+class Platform:
     """Database-backed instance of the ixmp.
 
     Each Platform connects three components:
@@ -89,6 +111,7 @@ class Platform(object):
         .. _`JVM documentation`: https://docs.oracle.com/javase/7/docs
            /technotes/tools/windows/java.html)
     """
+
     def __init__(self, dbprops=None, dbtype=None, jvmargs=None):
         start_jvm(jvmargs)
         self.dbtype = dbtype
@@ -97,6 +120,9 @@ class Platform(object):
             # if no dbtype is specified, launch Platform with properties file
             if dbtype is None:
                 dbprops = _config.find_dbprops(dbprops)
+                if dbprops is None:
+                    raise ValueError("Not found database properties file "
+                                     "to launch platform")
                 logger().info("launching ixmp.Platform using config file at "
                               "'{}'".format(dbprops))
                 self._jobj = java.ixmp.Platform("Python", str(dbprops))
@@ -293,8 +319,8 @@ class Platform(object):
         else:
             _logger_region_exists(_regions, region)
 
-    def add_region_synomym(self, region, mapped_to):
-        """Define a synomym for a `region`.
+    def add_region_synonym(self, region, mapped_to):
+        """Define a synonym for a `region`.
 
         When adding timeseries data using the synonym in the region column, it
         will be converted to `mapped_to`.
@@ -312,12 +338,37 @@ class Platform(object):
         else:
             _logger_region_exists(_regions, region)
 
+    def check_access(self, user, models, access='view'):
+        """Check access to specific model
+
+        Parameters
+        ----------
+        user: str
+            Registered user name
+        models : str or list of str
+            Model(s) name
+        access : str, optional
+            Access type - view or edit
+        """
+
+        if isinstance(models, str):
+            return self._jobj.checkModelAccess(user, access, models)
+        else:
+            models_list = java.LinkedList()
+            for model in models:
+                models_list.add(model)
+            access_map = self._jobj.checkModelAccess(user, access, models_list)
+            result = {}
+            for model in models:
+                result[model] = access_map.get(model) == 1
+            return result
+
 
 def _logger_region_exists(_regions, r):
     region = _regions.set_index('region').loc[r]
     msg = 'region `{}` is already defined in the platform instance'
     if region['mapped_to'] is not None:
-        msg += ' as synomym for region `{}`'.format(region.mapped_to)
+        msg += ' as synonym for region `{}`'.format(region.mapped_to)
     if region['parent'] is not None:
         msg += ', as subregion of `{}`'.format(region.parent)
     logger().info(msg.format(r))
@@ -325,7 +376,7 @@ def _logger_region_exists(_regions, r):
 # %% class TimeSeries
 
 
-class TimeSeries(object):
+class TimeSeries:
     """Generic collection of data in time series format.
 
     TimeSeries is the parent/super-class of :class:`Scenario`.
@@ -440,9 +491,8 @@ class TimeSeries(object):
     # functions for importing and retrieving timeseries data
 
     def preload_timeseries(self):
-        """Preload Timeseries data to in-memory cache. Useful for bulk updates.
+        """Preload timeseries data to in-memory cache. Useful for bulk updates.
         """
-
         self._jobj.preloadAllTimeseries()
 
     def add_timeseries(self, df, meta=False):
@@ -1310,7 +1360,7 @@ class Scenario(TimeSeries):
     def solve(self, model, case=None, model_file=None, in_file=None,
               out_file=None, solve_args=None, comment=None, var_list=None,
               equ_list=None, check_solution=True, callback=None,
-              cb_kwargs={}):
+              gams_args=['LogOption=4'], cb_kwargs={}):
         """Solve the model and store output.
 
         ixmp 'solves' a model using the following steps:
@@ -1355,6 +1405,12 @@ class Scenario(TimeSeries):
             Method to execute arbitrary non-model code. Must accept a single
             argument, the Scenario. Must return a non-:obj:`False` value to
             indicate convergence.
+        gams_args : list of str, optional
+            Additional arguments for the CLI call to GAMS. See, e.g.,
+            https://www.gams.com/latest/docs/UG_GamsCall.html#UG_GamsCall_ListOfCommandLineParameters
+
+            - `LogOption=4` prints output to stdout (not console) and the log
+              file.
         cb_kwargs : dict, optional
             Keyword arguments to pass to `callback`.
 
@@ -1412,7 +1468,7 @@ class Scenario(TimeSeries):
             self.to_gdx(ipth, ingdx)
 
             # Invoke GAMS
-            run_gams(model_file, args)
+            run_gams(model_file, args, gams_args=gams_args)
 
             # Read model solution
             self.read_sol_from_gdx(opth, outgdx, comment,

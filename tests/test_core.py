@@ -44,7 +44,7 @@ def test_db_config_path(tmp_env, test_mp_props, caplog):
 
     # Platform is instantiated used a relative filename, found in the
     # database configuration path
-    mp = ixmp.Platform(test_mp_props.name)
+    mp = ixmp.Platform(test_mp_props)
     assert launch_log_msg.format(test_mp_props) in caplog.text
 
     scenario = mp.scenario_list(model='Douglas Adams')['scenario']
@@ -108,9 +108,8 @@ def test_init_set(test_mp):
     scen = ixmp.Scenario(test_mp, *can_args)
 
     # Add set on a locked scenario
-    with pytest.raises(jpype.JavaException,
-                       match="at.ac.iiasa.ixmp.exceptions.IxException: This "
-                             "Scenario cannot be edited, do a checkout "
+    with pytest.raises(jpype.JException,
+                       match="This Scenario cannot be edited, do a checkout "
                              "first!"):
         scen.init_set('foo')
 
@@ -119,9 +118,8 @@ def test_init_set(test_mp):
     scen.init_set('foo')
 
     # Initialize an already-existing set
-    with pytest.raises(jpype.JavaException,
-                       match="at.ac.iiasa.ixmp.exceptions.IxException: "
-                             "An Item with the name 'foo' already exists!"):
+    with pytest.raises(jpype.JException,
+                       match="An Item with the name 'foo' already exists!"):
         scen.init_set('foo')
 
 
@@ -130,9 +128,8 @@ def test_add_set(test_mp):
     scen = ixmp.Scenario(test_mp, *can_args)
 
     # Add element to a non-existent set
-    with pytest.raises(jpype.JavaException,
-                       match="at.ac.iiasa.ixmp.exceptions.IxException: "
-                             "No Set 'foo' exists in this Scenario!"):
+    with pytest.raises(jpype.JException,
+                       match="No Set 'foo' exists in this Scenario!"):
         scen.add_set('foo', 'bar')
 
 
@@ -287,7 +284,7 @@ def test_solve_callback(test_mp, test_data_path):
 
     # Solve the scenario as configured
     solve_args = dict(model=str(test_data_path / 'transport_ixmp'),
-                      case='transport_standard')
+                      case='transport_standard', gams_args=['LogOption=2'])
     scen.solve(**solve_args)
 
     # Store the expected value of the decision variable, x

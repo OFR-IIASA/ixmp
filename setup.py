@@ -11,7 +11,7 @@ with open('README.md', 'r') as f:
     LONG_DESCRIPTION = f.read()
 
 INSTALL_REQUIRES = [
-    'JPype1>=0.6.2',
+    'JPype1>=0.7',
     'click',
     'dask[array]',
     'graphviz',
@@ -24,7 +24,7 @@ INSTALL_REQUIRES = [
 ]
 
 EXTRAS_REQUIRE = {
-    'tests': ['pytest>=3.9', 'jupyter'],
+    'tests': ['pytest>=3.9', 'jupyter', 'pretenders>=1.4.4'],
     'docs': ['numpydoc', 'sphinx', 'sphinx_rtd_theme', 'sphinxcontrib-bibtex'],
     'tutorial': ['jupyter'],
 }

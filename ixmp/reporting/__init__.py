@@ -44,7 +44,7 @@ from .describe import describe_recursive
 log = logging.getLogger(__name__)
 
 
-class Reporter(object):
+class Reporter:
     """Class for generating reports on :class:`ixmp.Scenario` objects."""
     # TODO meet the requirements:
     # A3iii. Interpolation.
@@ -205,16 +205,26 @@ class Reporter(object):
                computations.
             4. A list containing one or more of #1, #2, and/or #3.
         strict : bool, optional
-            If True (default), *key* must not already exist in the Reporter.
+            If True, *key* must not already exist in the Reporter, and
+            any keys referred to by *computation* must exist.
 
         Raises
         ------
         KeyError
-            If `key` is already in the Reporter.
+            If `key` is already in the Reporter, or any key referred to by
+            `computation` does not exist.
         """
-        if strict and key in self.graph:
-            raise KeyError(key)
+        if strict:
+            # Key already exists in graph
+            if key in self.graph:
+                raise KeyError(key)
+
+            # Check that keys used in *computation* are in the graph
+            keylike = filter(lambda e: isinstance(e, (str, Key)), computation)
+            self.check_keys(*keylike)
+
         self.graph[key] = computation
+
         return key
 
     def apply(self, generator, *keys):
@@ -228,6 +238,7 @@ class Reporter(object):
         keys : hashable
             The starting key(s)
         """
+        keys = self.check_keys(*keys)
         try:
             self.graph.update(generator(*keys))
         except TypeError as e:
@@ -275,6 +286,34 @@ class Reporter(object):
         """
         return self._index[name]
 
+    def check_keys(self, *keys):
+        """Check that *keys* are in the Reporter.
+
+        If any of *keys* is not in the Reporter, KeyError is raised.
+        Otherwise, a list is returned with either the key from *keys*, or the
+        corresponding :meth:`full_key`.
+        """
+        result = []
+        missing = []
+
+        # Process all keys to produce more useful error messages
+        for key in keys:
+            # Add the key directly if it is in the graph
+            if key in self.graph:
+                result.append(key)
+                continue
+
+            # Try adding the full key
+            try:
+                result.append(self._index[key])
+            except KeyError:
+                missing.append(key)
+
+        if len(missing):
+            raise KeyError(missing)
+
+        return result
+
     def __contains__(self, name):
         return name in self.graph
 
@@ -306,7 +345,7 @@ class Reporter(object):
                 self.graph['filters'].pop(key, None)
 
     # ixmp data model manipulations
-    def add_product(self, name, quantities, sums=True):
+    def add_product(self, name, *quantities, sums=True):
         """Add a computation that takes the product of *quantities*.
 
         Parameters
@@ -322,14 +361,8 @@ class Reporter(object):
         Key
             The full key of the new quantity.
         """
-        # TODO when py2 support is dropped, convert 'quantities' to
-        #      '*quantities' in the signature.
-
         # Fetch the full key for each quantity
-        try:
-            base_keys = [self.full_key(q) for q in quantities]
-        except KeyError:
-            return None
+        base_keys = self.check_keys(*quantities)
 
         # Compute a key for the result
         key = Key.product(name, *base_keys)

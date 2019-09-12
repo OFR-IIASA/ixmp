@@ -1,4 +1,5 @@
 import collections
+from copy import deepcopy
 
 from functools import partial, reduce
 from itertools import compress
@@ -6,6 +7,7 @@ import logging
 from operator import mul
 
 import pandas as pd
+from pandas.core.generic import NDFrame
 import pint
 import xarray as xr
 
@@ -47,10 +49,7 @@ class Key:
             dims = value._dims.copy()
             _tag = value._tag
         else:
-            # TODO after py2.7 compatibility is dropped, use:
-            # name, *dims = value.split(':')
-            dims = value.split(':')
-            name = dims.pop(0)
+            name, *dims = value.split(':')
             _tag = dims[1] if len(dims) == 2 else None
             dims = dims[0].split('-')
         if drop:
@@ -183,10 +182,7 @@ def keys_for_quantity(ix_type, name, scenario):
                 'scenario', 'filters'))
 
     # Partial sums
-    # py2 compat: would prefer to do:
-    # yield from key.iter_sums()
-    for k in key.iter_sums():
-        yield k
+    yield from key.iter_sums()
 
 
 def _parse_units(units_series):
@@ -194,7 +190,7 @@ def _parse_units(units_series):
     unit = pd.unique(units_series)
 
     if len(unit) > 1:
-        # py2 compat: could use an f-string here
+        # py3.5 compat: could use an f-string here
         log.info('Mixed units {} discarded'.format(unit))
         unit = ['']
 
@@ -220,7 +216,7 @@ def _parse_units(units_series):
                 # Unit already defined
                 continue
 
-            # py2 compat: could use f-strings here
+            # py3.5 compat: could use f-strings here
             definition = '{0} = [{0}]'.format(u)
             log.info('Add unit definition: {}'.format(definition))
 
@@ -232,8 +228,7 @@ def _parse_units(units_series):
             unit = ureg.parse_units(unit)
         except pint.UndefinedUnitError:
             # Handle the silent failure of define(), above
-            # py2 compat: would prefer to raise 'from None'
-            raise invalid(unit)
+            raise invalid(unit) from None
     except AttributeError:
         # Unit contains a character like '-' that throws off pint
         # NB this 'except' clause must be *after* UndefinedUnitError, since
@@ -256,7 +251,7 @@ class AttrSeries(pd.Series):
     """
 
     # normal properties
-    _metadata = ['attrs']
+    _metadata = ('attrs', )
 
     def __init__(self, *args, **kwargs):
         if 'attrs' in kwargs:
@@ -299,8 +294,14 @@ class AttrSeries(pd.Series):
         try:
             dim = kwargs.pop('dim')
             if isinstance(self.index, pd.MultiIndex):
-                obj = self.unstack(dim)
-                kwargs['axis'] = 1
+                if len(dim) == len(self.index.names):
+                    # assume dimensions = full multi index, do simple sum
+                    obj = self
+                    kwargs = {}
+                else:
+                    # pivot and sum across columns
+                    obj = self.unstack(dim)
+                    kwargs['axis'] = 1
             else:
                 if dim != [self.index.name]:
                     raise ValueError(dim, self.index.name, self)
@@ -323,6 +324,18 @@ class AttrSeries(pd.Series):
     @property
     def _constructor(self):
         return AttrSeries
+
+    def __finalize__(self, other, method=None, **kwargs):
+        """Propagate metadata from other to self.
+
+        This is identical to the version in pandas, except deepcopy() is added
+        so that the 'attrs' OrderedDict is not double-referenced.
+        """
+        if isinstance(other, NDFrame):
+            for name in self._metadata:
+                object.__setattr__(self, name,
+                                   deepcopy(getattr(other, name, None)))
+        return self
 
 
 def data_for_quantity(ix_type, name, column, scenario, filters=None):
