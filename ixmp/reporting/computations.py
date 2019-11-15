@@ -2,17 +2,24 @@
 # Notes:
 # - To avoid ambiguity, computations should not have default arguments. Define
 #   default values for the corresponding methods on the Reporter class.
+from pathlib import Path
 
 import pandas as pd
 import xarray as xr
 
-from .utils import collect_units, Quantity, concat
+from .utils import (
+    AttrSeries,
+    Quantity,
+    collect_units,
+    filter_concat_args,
+)
 
 __all__ = [
     'aggregate',
+    'concat',
     'disaggregate_shares',
-    'make_dataframe',
     'load_file',
+    'product',
     'sum',
     'write_report',
 ]
@@ -31,37 +38,76 @@ def sum(quantity, weights=None, dimensions=None):
     else:
         w_total = weights.sum(dim=dimensions)
 
-    result = Quantity(quantity * weights).sum(dim=dimensions) / w_total
+    result = (quantity * weights).sum(dim=dimensions) / w_total
     result.attrs['_unit'] = collect_units(quantity)[0]
 
     return result
 
 
 def aggregate(quantity, groups, keep):
-    """Aggregate *quantity* by *groups*."""
+    """Aggregate *quantity* by *groups*.
+
+    Parameters
+    ----------
+    quantity : :class:`Quantity <ixmp.reporting.utils.Quantity>`
+    groups: dict of dict
+        Top-level keys are the names of dimensions in `quantity`. Second-level
+        keys are group names; second-level values are lists of labels along the
+        dimension to sum into a group.
+    keep : bool
+        If True, the members that are aggregated into a group are returned with
+        the group sums. If False, they are discarded.
+
+    Returns
+    -------
+    :class:`Quantity <ixmp.reporting.utils.Quantity>`
+        Same dimensionality as `quantity`.
+
+    """
+    # NB .transpose() below is necessary only for Quantity == AttrSeries. It
+    #   can be removed when Quantity = xr.DataArray.
+    dim_order = quantity.dims
+
     for dim, dim_groups in groups.items():
-        values = []
+        # Optionally keep the original values
+        values = [quantity] if keep else []
+
+        # Aggregate each group
         for group, members in dim_groups.items():
             values.append(quantity.sel({dim: members})
                                   .sum(dim=dim)
-                                  .assign_coords(**{dim: group}))
-        if keep:
-            # Prepend the original values
-            values.insert(0, quantity)
+                                  .assign_coords(**{dim: group})
+                                  .transpose(*dim_order))
 
         # Reassemble to a single dataarray
-        quantity = concat(values, dim=dim)
+        quantity = concat(*values, dim=dim)
 
     return quantity
 
 
+def concat(*objs, **kwargs):
+    """Concatenate Quantity *objs*.
+
+    Any strings included amongst *args* are discarded, with a logged warning;
+    these usually indicate that a quantity is referenced which is not in the
+    Reporter.
+    """
+    objs = filter_concat_args(objs)
+    if Quantity is AttrSeries:
+        kwargs.pop('dim')
+        return pd.concat(objs, **kwargs)
+    elif Quantity is xr.DataArray:  # pragma: no cover
+        return xr.concat(objs, **kwargs)
+
+
 def disaggregate_shares(quantity, shares):
     """Disaggregate *quantity* by *shares*."""
-    return Quantity(quantity * shares,
-                    attrs={'_unit': collect_units(quantity)[0]})
+    result = quantity * shares
+    result.attrs['_unit'] = collect_units(quantity)[0]
+    return result
 
 
-def product(*quantities, drop=True):
+def product(*quantities):
     """Return the product of any number of *quantities*."""
     if len(quantities) == 1:
         quantities = [quantities]
@@ -72,20 +118,33 @@ def product(*quantities, drop=True):
     # Initialize result values with first entry
     result, u_result = next(items)
 
+    def _align_levels(ref, obj):
+        """Work around https://github.com/pandas-dev/pandas/issues/25760
+
+        Return a copy of *obj* with common levels in the same order as *ref*.
+
+        TODO remove when Quantity is xr.DataArray, or above issues is closed.
+        """
+        if not isinstance(obj.index, pd.MultiIndex):
+            return obj
+        common = [n for n in ref.index.names if n in obj.index.names]
+        unique = [n for n in obj.index.names if n not in common]
+        return obj.reorder_levels(common + unique)
+
     # Iterate over remaining entries
     for q, u in items:
-        result = result * q
+        if Quantity is AttrSeries:
+            result = (result * _align_levels(result, q)).dropna()
+        else:
+            result = result * q
         u_result *= u
 
     result.attrs['_unit'] = u_result
 
-    if drop:
-        result.dropna(inplace=True)
-
     return result
 
 
-def ratio(numerator, denominator, drop=True):
+def ratio(numerator, denominator):
     """Return the ratio *numerator* / *denominator*."""
     # Handle units
     u_num, u_denom = collect_units(numerator, denominator)
@@ -93,17 +152,10 @@ def ratio(numerator, denominator, drop=True):
     result = numerator / denominator
     result.attrs['_unit'] = u_num / u_denom
 
-    if drop:
+    if Quantity is AttrSeries:
         result.dropna(inplace=True)
 
     return result
-
-
-# Conversion
-def make_dataframe(*quantities):
-    """Concatenate *quantities* into a single pd.DataFrame."""
-    # TODO also rename
-    raise NotImplementedError
 
 
 # Input and output
@@ -127,17 +179,25 @@ def load_file(path):
         return xr.DataArray.from_series(data.set_index(index_columns)['value'])
     elif path.suffix in ('.xls', '.xlsx'):
         # TODO define expected Excel data input format
-        raise NotImplementedError
+        raise NotImplementedError  # pragma: no cover
     elif path.suffix == '.yaml':
         # TODO define expected YAML data input format
-        raise NotImplementedError
+        raise NotImplementedError  # pragma: no cover
     else:
         # Default
         return open(path).read()
 
 
 def write_report(quantity, path):
-    """Write the report identified by *key* to the file at *path*."""
+    """Write a quantity to a file.
+
+    Parameters
+    ----------
+    path : str or Path
+        Path to the file to be written.
+    """
+    path = Path(path)
+
     if path.suffix == '.csv':
         quantity.to_dataframe().to_csv(path)
     elif path.suffix == '.xlsx':

@@ -26,16 +26,14 @@
 # Apple file system
 .DS_Store
 
-# local version of auto-documentation features
-/doc/build/**
-/doc/source/model/**
+# sphinx
+doc/build
+# Compiled SVG
+doc/source/_static/*.svg
 
-# files generated during install
+# setuptools
 build
 dist
-
-# credentials
-config/*.properties
 
 # testdb
 .cache/**
@@ -55,9 +53,12 @@ rixmp/source/.Rhistory
 # virtualenv
 .env
 
-# pytest
-.coverage
+# pytest and related
+*.pid
+.coverage*
 .pytest_cache/
+coverage.xml
+htmlcov/
 
 # idea
 .idea/

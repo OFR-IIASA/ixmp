@@ -1,3 +1,5 @@
+# Installation script for Linux/macOS CI on Travis
+
 # Install GAMS
 $CACHE/$GAMSFNAME > install.out
 
@@ -12,23 +14,22 @@ which gams
 $CACHE/$CONDAFNAME -b -u -p $HOME/miniconda
 conda update --yes conda
 
-# Create named env
+# Create named environment
 conda create -n testing python=$PYVERSION --yes
 
-# Install deps
+# Install dependencies
 conda install -n testing -c conda-forge --yes \
       ixmp \
+      codecov \
       pytest \
-      coveralls \
       pytest-cov
 conda remove -n testing --force --yes ixmp
 
-# Use '.' (POSIX) instead of 'source' (a bashism)
+# Activate the environment. Use '.' (POSIX) instead of 'source' (a bashism).
 . activate testing
 
 # Show information
 conda info --all
 
-# Install R packages needed for testing
-Rscript -e "install.packages(c('devtools', 'IRkernel'), lib = '$R_LIBS_USER')"
+# Install IR kernel spec for Jupyter notebook
 Rscript -e "IRkernel::installspec()"
