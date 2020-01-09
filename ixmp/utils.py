@@ -1,9 +1,11 @@
 from collections.abc import Iterable
 import logging
+import re
 from urllib.parse import urlparse
 
 import pandas as pd
 import six
+from pathlib import Path
 
 
 # globally accessible logger
@@ -127,7 +129,8 @@ def parse_url(url):
 
 def pd_read(f, *args, **kwargs):
     """Try to read a file with pandas, no fancy stuff"""
-    if f.endswith('csv'):
+    f = Path(f)
+    if f.suffix == '.csv':
         return pd.read_csv(f, *args, **kwargs)
     else:
         return pd.read_excel(f, *args, **kwargs)
@@ -135,8 +138,9 @@ def pd_read(f, *args, **kwargs):
 
 def pd_write(df, f, *args, **kwargs):
     """Try to write one or more dfs with pandas, no fancy stuff"""
+    f = Path(f)
     is_pd = isinstance(df, (pd.DataFrame, pd.Series))
-    if f.endswith('csv'):
+    if f.suffix == '.csv':
         if not is_pd:
             raise ValueError('Must pass a Dataframe if using csv files')
         df.to_csv(f, *args, **kwargs)
@@ -192,3 +196,97 @@ def import_timeseries(scenario, data, firstyear=None, lastyear=None):
         annot = '{} until {}'.format(annot, lastyear)
 
     scenario.commit(annot)
+
+
+def format_scenario_list(platform, model=None, scenario=None, match=None,
+                         default_only=False, as_url=False):
+    """Return a formatted list of Scenarios on *platform*.
+
+    Parameters
+    ----------
+    platform : :class:`.Platform`
+    model : str, optional
+        Model name to restrict results. Passed to :meth:`.scenario_list`.
+    scenario : str, optional
+        Scenario name to restrict results. Passed to :meth:`.scenario_list`.
+    match : str, optional
+        Regular expression to restrict results. Only results where the model or
+        scenario name matches are returned.
+    default_only : bool, optional
+        Only return scenarios where a default version has been set with
+        :meth:`.set_as_default`.
+    as_url : bool, optional
+        Format results as ixmp URLs.
+
+    Returns
+    -------
+    list of str
+        If *as_url* is :obj:`False`, also include summary information.
+    """
+
+    try:
+        match = re.compile('.*' + match + '.*')
+    except TypeError:
+        pass
+
+    def describe(df):
+        N = len(df)
+        min = df.version.min()
+        max = df.version.max()
+
+        result = dict(N=N, range='')
+        if N > 1:
+            result['range'] = '{}–{}'.format(min, max)
+            if N != max:
+                result['range'] += ' ({} versions)'.format(N)
+
+        try:
+            mask = df.is_default.astype(bool)
+            result['default'] = df.loc[mask, 'version'].iat[0]
+        except IndexError:
+            result['default'] = max
+
+        return pd.Series(result)
+
+    info = platform.scenario_list(model=model, scen=scenario,
+                                  default=default_only) \
+        .groupby(['model', 'scenario']) \
+        .apply(describe) \
+        .reset_index()
+
+    info['scenario'] = info['scenario'] \
+        .str.cat(info['default'].astype(str), sep='#')
+
+    if match:
+        info = info[info['model'].str.match(match)
+                    | info['scenario'].str.match(match)]
+
+    if as_url:
+        info['url'] = 'ixmp://{}'.format(platform.name)
+        urls = info['url'].str.cat([info['model'], info['scenario']], sep='/')
+        lines = urls.tolist()
+    else:
+        lines = []
+
+        if len(info):
+            info['scenario'] = info['scenario'] \
+                .str.ljust(info['scenario'].str.len().max())
+
+        for model, m_info in info.groupby(['model']):
+            lines.extend([
+                '',
+                model + '/',
+                '  ' + '\n  '.join(m_info['scenario'].str.cat(m_info['range']))
+            ])
+
+    # Summary information
+    if not as_url:
+        lines.extend([
+            '',
+            str(len(info['model'].unique())) + ' model name(s)',
+            str(len(info['scenario'].unique())) + ' scenario name(s)',
+            str(len(info)) + ' (model, scenario) combination(s)',
+            str(info['N'].sum()) + ' total scenarios',
+        ])
+
+    return lines
