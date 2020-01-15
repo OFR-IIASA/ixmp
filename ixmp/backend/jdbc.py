@@ -2,6 +2,7 @@ from copy import copy
 from collections import ChainMap
 from collections.abc import Collection, Iterable
 from functools import lru_cache
+from itertools import chain
 import logging
 import os
 from pathlib import Path, PurePosixPath
@@ -116,23 +117,30 @@ class JDBCBackend(CachingBackend):
 
     Parameters
     ----------
-    dbtype : 'HSQLDB', optional
-        Database type to use. If :obj:`None`, a remote database is accessed. If
-        'HSQLDB', a local database is created and used at the path given by
-        `dbprops`.
-
-    dbprops : path-like, optional
-        If `dbtype` is :obj:`None`, the name of a *database properties file*
-        (default: ``default.properties``) in the properties file directory
-        (see :class:`.Config`) or a path to a properties file.
-
-        If `dbtype` is 'HSQLDB'`, the path of a local database,
-        (default: ``$HOME/.local/ixmp/localdb/default``) or name of a
-        database file in the local database directory (default:
-        ``$HOME/.local/ixmp/localdb/``).
-
+    driver : 'oracle' or 'hsqldb'
+        JDBC driver to use.
+    path : path-like, optional
+        Path to the HyperSQL database.
+    url : str, optional
+        Partial or complete JDBC URL for the Oracle or HyperSQL database,
+        e.g. ``database-server.example.com:PORT:SCHEMA``. See
+        :ref:`configuration`.
+    user : str, optional
+        Database user name.
+    password : str, optional
+        Database user password.
     jvmargs : str, optional
-        Java Virtual Machine arguments. See :func:`.start_jvm`.
+        Java Virtual Machine arguments. See :meth:`.start_jvm`.
+    dbprops : path-like, optional
+        With ``driver='oracle'``, the path to a database properties file
+        containing `driver`, `url`, `user`, and `password` information
+
+        .. deprecated:: 2.0
+           With ``driver='hsqldb'``, the path to a local database, excluding
+           the '.lobs' suffix.
+    dbtype : str, optional
+        .. deprecated:: 2.0
+           Use `driver`.
     """
     # NB Much of the code of this backend is in Java, in the iiasa/ixmp_source
     #    Github repository.
@@ -185,6 +193,8 @@ class JDBCBackend(CachingBackend):
             elif (not dbprops.exists()
                   and dbprops.with_suffix('.lobs').exists()):
                 # Actually the basename for a HSQLDB
+                warn("Specifying driver='hsqldb' location with 'dbprops'; use"
+                     "'path'", DeprecationWarning)
                 kwargs.setdefault('driver', 'hsqldb')
                 kwargs.setdefault('path', dbprops)
             else:
@@ -247,7 +257,7 @@ class JDBCBackend(CachingBackend):
         try:
             self.jobj.closeDB()
         except java.IxException as e:
-            if str(e) == 'Error closing the database connection!':
+            if 'Error closing the database connection!' in str(e):
                 log.warning('Database connection could not be closed or was '
                             'already closed')
             else:
@@ -495,7 +505,7 @@ class JDBCBackend(CachingBackend):
             func(name, idx_sets, idx_names)
         except jpype.JException as e:
             e = str(e)
-            if e.startswith('This Scenario cannot be edited'):
+            if 'This Scenario cannot be edited' in e:
                 raise RuntimeError(e)
             elif 'already exists' in e:
                 raise ValueError('{!r} already exists'.format(name))
@@ -503,7 +513,7 @@ class JDBCBackend(CachingBackend):
                 raise
 
     def delete_item(self, s, type, name):
-        getattr(self.jindex[s], f'remove{type.title()}')()
+        getattr(self.jindex[s], f'remove{type.title()}')(name)
         self.cache_invalidate(s, type, name)
 
     def item_index(self, s, name, sets_or_names):
@@ -657,7 +667,14 @@ class JDBCBackend(CachingBackend):
                 for entry in self.jindex[s].getMeta().entrySet()}
 
     def set_meta(self, s, name, value):
-        self.jindex[s].setMeta(name, value)
+        _type = type(value)
+        try:
+            _type = {int: 'Num', float: 'Num', str: 'Str', bool: 'Bool'}[_type]
+            method_name = 'setMeta' + _type
+        except KeyError:
+            raise TypeError('Cannot store metadata of type {}'.format(_type))
+
+        getattr(self.jindex[s], method_name)(name, value)
 
     def clear_solution(self, s, from_year=None):
         from ixmp.core import Scenario
@@ -735,7 +752,7 @@ class JDBCBackend(CachingBackend):
                 raise RuntimeError('unhandled Java exception') from e
 
 
-def start_jvm(jvmargs=None):
+def start_jvm(jvmargs=[]):
     """Start the Java Virtual Machine via :mod:`JPype`.
 
     Parameters
@@ -751,32 +768,29 @@ def start_jvm(jvmargs=None):
         .. _`JVM documentation`: https://docs.oracle.com/javase/7/docs
            /technotes/tools/windows/java.html)
     """
-    # TODO change the jvmargs default to [] instead of None
     if jpype.isJVMStarted():
         return
 
-    jvmargs = jvmargs or []
-
     # Arguments
-    args = [jpype.getDefaultJVMPath()]
+    args = jvmargs if isinstance(jvmargs, list) else [jvmargs]
 
-    # Add the ixmp root directory, ixmp.jar and bundled .jar and .dll files to
-    # the classpath
-    module_root = Path(__file__).parents[1]
-    jarfile = module_root / 'ixmp.jar'
-    module_jars = list(module_root.glob('lib/*'))
-    classpath = map(str, [module_root, jarfile] + list(module_jars))
+    # Base for Java classpath entries
+    cp = Path(__file__).parents[1]
 
-    sep = ';' if os.name == 'nt' else ':'
-    args.append('-Djava.class.path={}'.format(sep.join(classpath)))
+    # Keyword arguments
+    kwargs = dict(
+        # Given 'lib/*' JPype will only glob '*.jar', so glob here explicitly
+        classpath=map(str, chain([cp / 'ixmp.jar'], cp.glob('lib/*'))),
 
-    # Add user args
-    args.extend(jvmargs if isinstance(jvmargs, list) else [jvmargs])
+        # For JPype 0.7 (raises a warning) and 0.8 (default is False).
+        # 'True' causes Java string objects to be converted automatically to
+        # Python str(), as expected by ixmp Python code.
+        convertStrings=True,
+    )
 
-    # For JPype 0.7 (raises a warning) and 0.8 (default is False).
-    # 'True' causes Java string objects to be converted automatically to Python
-    # str(), as expected by ixmp Python code.
-    kwargs = dict(convertStrings=True)
+    log.debug('JAVA_HOME: {}'.format(os.environ.get('JAVA_HOME', '(not set)')))
+    log.debug('jpype.getDefaultJVMPath: {}'.format(jpype.getDefaultJVMPath()))
+    log.debug('args to startJVM: {} {}'.format(args, kwargs))
 
     jpype.startJVM(*args, **kwargs)
 
@@ -839,4 +853,4 @@ def to_jlist2(arg, convert=None):
 @lru_cache(1)
 def timespans():
     # Mapping for the enums of at.ac.iiasa.ixmp.objects.TimeSeries.TimeSpan
-    return {t.ordinal(): t.name() for t in java.TimeSpan.values()}
+    return {t.getDbValue(): t.name() for t in java.TimeSpan.values()}

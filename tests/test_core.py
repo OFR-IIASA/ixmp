@@ -106,6 +106,14 @@ def test_has_par(test_mp):
     assert not scen.has_par('m')
 
 
+def test_add_par(test_mp):
+    # add_par() broadcasts scalar values/units across multiple keys
+    scen = ixmp.Scenario(test_mp, *can_args)
+    scen.remove_solution()
+    scen.check_out()
+    scen.add_par('b', ['new-york', 'chicago'], value=100, unit='cases')
+
+
 def test_init_scalar(test_mp):
     scen = ixmp.Scenario(test_mp, *can_args)
     scen2 = scen.clone(keep_solution=False)
@@ -219,6 +227,15 @@ def test_set(test_mp):
     foo = {'i1', 'i2', 'i3', 'i6', 'i7', 'i8'} - {'i2'} - {'i7', 'i8'}
     assert foo == set(scen.set('foo')['dim_i'])
 
+    # Remove a set completely
+    assert 'h' not in scen.set_list()
+
+    scen.init_set('h')
+    assert 'h' in scen.set_list()
+
+    scen.remove_set('h')
+    assert 'h' not in scen.set_list()
+
 
 # make sure that changes to a scenario are copied over during clone
 def test_add_clone(test_mp):
@@ -226,7 +243,7 @@ def test_add_clone(test_mp):
     scen.check_out()
     scen.init_set('h')
     scen.add_set('h', 'test')
-    scen.commit("adding an index set 'h', wiht element 'test'")
+    scen.commit("adding an index set 'h', with element 'test'")
 
     scen2 = scen.clone(keep_solution=False)
     obs = scen2.set('h')
@@ -351,6 +368,10 @@ def test_meta(test_mp):
     obs = scen.get_meta('test_string')
     exp = test_dict['test_string']
     assert obs == exp
+
+    # Setting with a type other than int, float, bool, str raises TypeError
+    with pytest.raises(TypeError, match='Cannot store metadata of type'):
+        scen.set_meta('test_string', complex(1, 1))
 
 
 def test_load_scenario_data(test_mp):

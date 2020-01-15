@@ -1,8 +1,10 @@
 # The ix modeling platform (ixmp)
 
+[![PyPI version](https://img.shields.io/pypi/v/ixmp.svg)](https://pypi.python.org/pypi/ixmp/)
+[![Anaconda version](https://img.shields.io/conda/vn/conda-forge/ixmp)](https://anaconda.org/conda-forge/ixmp)
+[![Documentation build](https://readthedocs.com/projects/iiasa-energy-program-ixmp/badge/?version=master)](https://message.iiasa.ac.at/projects/ixmp/en/master/)
 [![Build status](https://travis-ci.org/iiasa/ixmp.svg?branch=master)](https://travis-ci.org/iiasa/ixmp)
 [![Test coverage](https://codecov.io/gh/iiasa/ixmp/branch/master/graph/badge.svg)](https://codecov.io/gh/iiasa/ixmp)
-[![Documentation build](https://readthedocs.com/projects/iiasa-energy-program-ixmp/badge/?version=master)](https://message.iiasa.ac.at/projects/ixmp/en/master/)
 
 ## Overview
 
@@ -18,7 +20,7 @@ examples for a generic model instance based on Dantzig's transport problem.
 
 ## License
 
-Copyright © 2017–2019 IIASA Energy Program
+Copyright © 2017–2020 IIASA Energy Program
 
 The platform package is licensed under the Apache License, Version 2.0 (the
 "License"); you may not use the files in this repository except in compliance
