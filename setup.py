@@ -9,11 +9,12 @@ with open('README.md', 'r') as f:
     LONG_DESCRIPTION = f.read()
 
 INSTALL_REQUIRES = [
-    'JPype1>=0.7',
+    # Temporary, to address segfaults with 0.7.2 on some systems
+    'JPype1>=0.7, !=0.7.2',
     'click',
     'dask[array]',
     'graphviz',
-    'pandas',
+    'pandas>=1.0',
     'pint',
     'PyYAML',
     'xarray',
@@ -23,12 +24,13 @@ INSTALL_REQUIRES = [
 
 EXTRAS_REQUIRE = {
     'tests': ['codecov', 'jupyter', 'pretenders>=1.4.4', 'pytest-cov',
-              'pytest>=3.9'],
+              'pytest>=5', 'sparse'],
     'docs': ['numpydoc', 'sphinx', 'sphinx_rtd_theme', 'sphinxcontrib-bibtex'],
     'tutorial': ['jupyter'],
 }
 
 LIB_FILES = [x.split('ixmp/')[-1] for x in glob.glob('ixmp/lib/*')]
+MODEL_FILES = ['model/dantzig.gms']
 
 setup(
     name='ixmp',
@@ -44,7 +46,7 @@ setup(
     extras_require=EXTRAS_REQUIRE,
     packages=find_packages(),
     package_dir={'ixmp': 'ixmp'},
-    package_data={'ixmp': ['ixmp.jar'] + LIB_FILES},
+    package_data={'ixmp': ['ixmp.jar'] + LIB_FILES + MODEL_FILES},
     entry_points={
         'console_scripts': [
             'ixmp=ixmp.cli:main',

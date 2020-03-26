@@ -3,18 +3,15 @@ from copy import copy
 import json
 
 from ixmp.core import TimeSeries, Scenario
+from . import ItemType
+from .io import ts_read_file, s_read_excel, s_write_excel
 
 
 class Backend(ABC):
     """Abstract base class for backends."""
-    # NB non-abstract methods like close_db() are marked '# pragma: no cover'.
-    #    In order to cover these with tests, define a MemoryBackend or similar
-    #    that provides implementations of all the abstract methods but does
-    #    NOT override the non-abstract methods; then call those.
 
-    def __init__(self):  # pragma: no cover
+    def __init__(self):
         """OPTIONAL: Initialize the backend."""
-        pass
 
     def __call__(self, obj, method, *args, **kwargs):
         """Call the backend method *method* for *obj*.
@@ -24,14 +21,13 @@ class Backend(ABC):
         """
         return getattr(self, method)(obj, *args, **kwargs)
 
-    def close_db(self):  # pragma: no cover
+    def close_db(self):
         """OPTIONAL: Close database connection(s).
 
         Close any database connection(s), if open.
         """
-        pass
 
-    def get_auth(self, user, models, kind):  # pragma: no cover
+    def get_auth(self, user, models, kind):
         """OPTIONAL: Return user authorization for *models*.
 
         If the Backend implements access control, this method **must** indicate
@@ -78,6 +74,46 @@ class Backend(ABC):
         See also
         --------
         set_node
+        """
+
+    @abstractmethod
+    def get_timeslices(self):
+        """Iterate over subannual timeslices defined on the Platform instance.
+
+        Yields
+        -------
+        tuple
+            The members of each tuple are:
+
+            ========= =========== ===
+            ID        Type        Description
+            ========= =========== ===
+            name      str         Time slice name
+            category  str         Time slice category
+            duration  float       Time slice duration (fraction of year)
+            ========= =========== ===
+
+        See also
+        --------
+        set_timeslice
+        """
+
+    @abstractmethod
+    def set_timeslice(self, name, category, duration):
+        """Add a subannual time slice to the Platform.
+
+        Parameters
+        ----------
+        name : str
+           Node name.
+        category : str
+           Time slice category.
+        duration : float
+           Time slice duration (a fraction of a year).
+
+        See also
+        --------
+        get_timeslices
         """
 
     @abstractmethod
@@ -132,22 +168,41 @@ class Backend(ABC):
         set_unit
         """
 
-    def open_db(self):  # pragma: no cover
+    def open_db(self):
         """OPTIONAL: (Re-)open database connection(s).
 
         A backend **may** connect to a database server. This method opens the
         database connection if it is closed.
         """
-        pass
 
-    def set_log_level(self, level):  # pragma: no cover
+    def set_log_level(self, level):
         """OPTIONAL: Set logging level for the backend and other code.
+
+        The default implementation has no effect.
 
         Parameters
         ----------
         level : int or Python logging level
+
+        See also
+        --------
+        get_log_level
         """
-        pass
+
+    def get_log_level(self):
+        """OPTIONAL: Get logging level for the backend and other code.
+
+        The default implementation has no effect.
+
+        Returns
+        -------
+        str
+            Name of a :py:ref:`Python logging level <levels>`.
+
+        See also
+        --------
+        set_log_level
+        """
 
     @abstractmethod
     def set_node(self, name, parent=None, hierarchy=None, synonym=None):
@@ -192,6 +247,111 @@ class Backend(ABC):
         get_units
         """
 
+    def read_file(self, path, item_type: ItemType, **kwargs):
+        """OPTIONAL: Read Platform, TimeSeries, or Scenario data from file.
+
+        A backend **may** implement read_file for one or more combinations of
+        the `path` and `item_type` methods. For all other combinations, it
+        **must** raise :class:`NotImplementedError`.
+
+        The default implementation supports:
+
+        - `path` ending in '.xlsx', `item_type` is ItemType.MODEL: read a
+          single Scenario given by kwargs['filters']['scenario'] from file
+          using :meth:`pandas.DataFrame.read_excel`.
+
+        Parameters
+        ----------
+        path : os.PathLike
+            File for input. The filename suffix determines the input format:
+
+            ====== ===
+            Suffix Format
+            ====== ===
+            .csv   Comma-separated values
+            .gdx   GAMS data exchange
+            .xlsx  Microsoft Office Open XML spreadsheet
+            ====== ===
+
+        item_type : ItemType
+            Type(s) of items to read.
+
+        Raises
+        ------
+        ValueError
+            If `ts` is not None and 'scenario' is a key in `filters`.
+        NotImplementedError
+            If input of the specified items from the file format is not
+            supported.
+
+        See also
+        --------
+        write_file
+        """
+        s, filters = self._handle_rw_filters(kwargs.pop('filters', {}))
+        if path.suffix in ('.csv', '.xlsx') and item_type is ItemType.TS and s:
+            ts_read_file(s, path, **kwargs)
+        elif path.suffix == '.xlsx' and item_type is ItemType.MODEL and s:
+            s_read_excel(self, s, path, **kwargs)
+        else:
+            raise NotImplementedError
+
+    def write_file(self, path, item_type: ItemType, **kwargs):
+        """OPTIONAL: Write Platform, TimeSeries, or Scenario data to file.
+
+        A backend **may** implement write_file for one or more combinations of
+        the `path` and `item_type` methods. For all other combinations, it
+        **must** raise :class:`NotImplementedError`.
+
+        The default implementation supports:
+
+        - `path` ending in '.xlsx', `item_type` is ItemType.MODEL: write a
+          single Scenario given by kwargs['filters']['scenario'] to file using
+          :meth:`pandas.DataFrame.to_excel`.
+
+        Parameters
+        ----------
+        path : os.PathLike
+            File for output. The filename suffix determines the output format.
+        item_type : ItemType
+            Type(s) of items to write.
+
+        Raises
+        ------
+        ValueError
+            If `ts` is not None and 'scenario' is a key in `filters`.
+        NotImplementedError
+            If output of the specified items to the file format is not
+            supported.
+
+        See also
+        --------
+        read_file
+        """
+        s, filters = self._handle_rw_filters(kwargs.pop('filters', {}))
+        if path.suffix == '.xlsx' and item_type is ItemType.MODEL and s:
+            s_write_excel(self, s, path)
+        else:
+            raise NotImplementedError
+
+    @staticmethod
+    def _handle_rw_filters(filters: dict):
+        """Helper for :meth:`read_file` and :meth:`write_file`.
+
+        The `filters` argument is unpacked if the 'scenarios' key is a single
+        :class:`TimeSeries` object. A 2-tuple is returned of the object (or
+        :obj:`None`) and the remaining filters.
+        """
+        ts = None
+        filters = copy(filters)
+        try:
+            if isinstance(filters['scenario'], TimeSeries):
+                ts = filters.pop('scenario')
+        except KeyError:
+            pass  # Don't modify filters at all
+
+        return ts, filters
+
     # Methods for ixmp.TimeSeries
 
     @abstractmethod
@@ -210,6 +370,11 @@ class Backend(ABC):
         Returns
         -------
         None
+
+        Raises
+        ------
+        RuntimeError
+            if *ts* is newly created and :meth:`commit` has not been called.
         """
 
     @abstractmethod
@@ -231,6 +396,12 @@ class Backend(ABC):
         Returns
         -------
         None
+
+        Raises
+        ------
+        ValueError
+            If :attr:`~.TimeSeries.model` or :attr:`~.TimeSeries.scenario` does
+            not exist on the Platform.
 
         See also
         --------
@@ -308,21 +479,22 @@ class Backend(ABC):
         tuple
             The members of each tuple are:
 
-            ======== ==== ===
-            ID       Type Description
-            ======== ==== ===
-            region   str  Region name
-            variable str  Variable name
-            time     str  Time period
-            year     int  Year
-            value    str  Value
-            unit     str  Unit symbol
-            meta     bool :obj:`True` if the data is marked as metadata
-            ======== ==== ===
+            ========= ==== ===
+            ID        Type Description
+            ========= ==== ===
+            region    str  Region name
+            variable  str  Variable name
+            year      int  Year
+            value     str  Value
+            unit      str  Unit symbol
+            subannual str  Name of time slice
+            meta      bool :obj:`True` if the data is marked as metadata
+            ========= ==== ===
         """
 
     @abstractmethod
-    def set_data(self, ts: TimeSeries, region, variable, data, unit, meta):
+    def set_data(self, ts: TimeSeries,
+                 region, variable, data, unit, subannual, meta):
         """Store *data*.
 
         Parameters
@@ -331,8 +503,8 @@ class Backend(ABC):
             Region name.
         variable : str
             Variable name.
-        time : str
-            Time period.
+        subannual : str
+            Name of time slice.
         unit : str
             Unit symbol.
         data : dict (int -> float)
@@ -342,7 +514,7 @@ class Backend(ABC):
         """
 
     @abstractmethod
-    def set_geo(self, ts: TimeSeries, region, variable, time, year, value,
+    def set_geo(self, ts: TimeSeries, region, variable, subannual, year, value,
                 unit, meta):
         """Store time-series 'geodata'.
 
@@ -352,8 +524,8 @@ class Backend(ABC):
             Region name.
         variable : str
             Variable name.
-        time : str
-            Time period.
+        subannual : str
+            Name of time slice.
         year : int
             Year.
         value : str
@@ -365,7 +537,7 @@ class Backend(ABC):
         """
 
     @abstractmethod
-    def delete(self, ts: TimeSeries, region, variable, years, unit):
+    def delete(self, ts: TimeSeries, region, variable, subannual, years, unit):
         """Remove data values.
 
         Parameters
@@ -378,6 +550,8 @@ class Backend(ABC):
             Years.
         unit : str
             Unit symbol.
+        subannual : str
+            Name of time slice.
 
         Returns
         -------
@@ -385,7 +559,8 @@ class Backend(ABC):
         """
 
     @abstractmethod
-    def delete_geo(self, ts: TimeSeries, region, variable, time, years, unit):
+    def delete_geo(self, ts: TimeSeries, region, variable, subannual, years,
+                   unit):
         """Remove 'geodata' values.
 
         Parameters
@@ -394,8 +569,8 @@ class Backend(ABC):
             Region name.
         variable : str
             Variable name.
-        time : str
-            Time period.
+        subannual : str
+            Name of time slice.
         years : Iterable of int
             Years.
         unit : str
@@ -451,7 +626,7 @@ class Backend(ABC):
 
         Returns
         -------
-        str
+        str or None
         """
 
     @abstractmethod
@@ -463,9 +638,8 @@ class Backend(ABC):
         int
         """
 
-    def preload(self, ts: TimeSeries):  # pragma: no cover
+    def preload(self, ts: TimeSeries):
         """OPTIONAL: Load *ts* data into memory."""
-        pass
 
     # Methods for ixmp.Scenario
 
@@ -536,18 +710,31 @@ class Backend(ABC):
         """
 
     @abstractmethod
-    def init_item(self, s: Scenario, type, name):
+    def init_item(self, s: Scenario, type, name, idx_sets, idx_names):
         """Initialize an item *name* of *type*.
 
         Parameters
         ----------
-        type : 'set' or 'par' or 'equ'
+        type : 'set' or 'par' or 'equ' or 'var'
         name : str
             Name for the new item.
+        idx_sets : list of str
+            If empty, a 0-dimensional/scalar item is initialized. Otherwise, a
+            1+-dimensional item is initialized.
+        idx_names : list of str or None
+            Optional names for the dimensions. If not supplied, the names of
+            the *idx_sets* (if any) are used. If supplied, *idx_names* and
+            *idx_sets* must be the same length.
 
         Return
         ------
         None
+
+        Raises
+        ------
+        ValueError
+            if any of the *idx_sets* is not an existing set in the Scenario;
+            if *idx_names* and *idx_sets* are not the same length.
         """
 
     @abstractmethod
@@ -603,7 +790,7 @@ class Backend(ABC):
             When *type* is 'set' and *name* an index set (not indexed by other
             sets).
         dict
-            When *type* is 'equ', 'par', or 'set' and *name* is scalar (zero-
+            When *type* is 'equ', 'par', or 'var' and *name* is scalar (zero-
             dimensional). The value has the keys 'value' and 'unit' (for 'par')
             or 'lvl' and 'mrg' (for 'equ' or 'var').
         pandas.DataFrame
@@ -611,6 +798,11 @@ class Backend(ABC):
             one column per index name with dimension values; plus the columns
             'value' and 'unit' (for 'par') or 'lvl' and 'mrg' (for 'equ' or
             'var').
+
+        Raises
+        ------
+        KeyError
+            If *name* does not exist in *s*.
         """
 
     @abstractmethod

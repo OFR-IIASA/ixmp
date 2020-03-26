@@ -4,6 +4,20 @@ Next release
 All changes
 -----------
 
+- `#286 <https://github.com/iiasa/ixmp/pull/286>`_: Add :meth:`.Scenario.to_excel` and :meth:`.read_excel`; this functionality is transferred to ixmp from :mod:`message_ix`.
+- `#270 <https://github.com/iiasa/ixmp/pull/270>`_: Include all tests in the ixmp package.
+- `#212 <https://github.com/iiasa/ixmp/pull/212>`_: Add :meth:`Model.initialize` API to help populate new Scenarios according to a model scheme.
+- `#267 <https://github.com/iiasa/ixmp/pull/267>`_: Apply units to reported quantities.
+- `#254 <https://github.com/iiasa/ixmp/pull/254>`_: Remove deprecated items:
+
+  - ~/.local/ixmp as a configuration location.
+  - positional and ``dbtype=`` arguments to :class:`.Platform`/:class:`.JDBCBackend`.
+  - ``first_model_year=``, ``keep_sol=``, and ``scen=`` arguments to :meth:`~.Scenario.clone`.
+  - ``rixmp.legacy``, an earlier version of :ref:`the R interface <rixmp>` that did not use reticulate.
+- `#261 <https://github.com/iiasa/ixmp/pull/261>`_: Increase minimum pandas
+  version to 1.0; adjust for `API changes and deprecations <https://pandas.pydata.org/pandas-docs/version/1.0.0/whatsnew/v1.0.0.html#backwards-incompatible-api-changes>`_.
+- `#243 <https://github.com/iiasa/ixmp/pull/243>`_: Add :meth:`.export_timeseries_data` to write data for multiple scenarios to CSV.
+- `#264 <https://github.com/iiasa/ixmp/pull/264>`_: Implement methods to get and create new subannual timeslices.
 
 v2.0.0 (2020-01-14)
 ===================

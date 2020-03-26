@@ -33,7 +33,6 @@ def _iter_config_paths():
         pass
 
     yield 'default', Path.home() / '.local' / 'share' / 'ixmp'
-    yield 'default (ixmp<=1.1)', Path.home() / '.local' / 'ixmp'
 
 
 # Recognized configuration keys; name -> (type, default value)
@@ -209,7 +208,7 @@ class Config:
         # Update the path attribute to match the written file
         self.path = path
 
-    def add_platform(self, name, *args):
+    def add_platform(self, name, *args, **kwargs):
         """Add or overwrite information about a platform.
 
         Parameters
@@ -222,6 +221,8 @@ class Config:
             Otherwise, the first of *args* specifies one of the
             :obj:`~.BACKENDS`, and the remaining *args* are specific to that
             backend.
+        kwargs
+            Keyword arguments. These differ according to backend.
         """
         args = list(args)
         if name == 'default':
@@ -233,6 +234,7 @@ class Config:
         else:
             cls = args.pop(0)
             info = {'class': cls}
+            info.update(kwargs)
 
             if cls == 'jdbc':
                 info['driver'] = args.pop(0)
@@ -242,7 +244,13 @@ class Config:
                     info['user'] = args.pop(0)
                     info['password'] = args.pop(0)
                 elif info['driver'] == 'hsqldb':
-                    info['path'] = Path(args.pop(0)).resolve()
+                    try:
+                        info['path'] = Path(args.pop(0)).resolve()
+                    except IndexError:
+                        if 'url' not in info:
+                            raise ValueError('must supply either positional'
+                                             'path or url= keyword for '
+                                             'JDBCBackend with driver=hsqldb')
                 assert len(args) == 0
             else:
                 raise ValueError(cls)

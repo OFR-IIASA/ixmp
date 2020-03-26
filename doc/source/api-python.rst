@@ -3,7 +3,7 @@
 Python (:mod:`ixmp` package)
 ============================
 
-The |ixmp| application progamming interface (API) is organized around three classes:
+The |ixmp| application programming interface (API) is organized around three classes:
 
 .. autosummary::
 
@@ -27,6 +27,7 @@ Platform
       regions
       scenario_list
       set_log_level
+      units
 
 
 TimeSeries
@@ -47,7 +48,7 @@ TimeSeries
         :meth:`Scenario.solve`. See :attr:`ixmp.model.MODELS`.
 
    2. `scenario`: the name of a specific, coherent description of the real-
-      world system being modeled. Any `model` may be used to represent mutiple
+      world system being modeled. Any `model` may be used to represent multiple
       alternate, or 'counter-factual', `scenarios`.
    3. `version`: an integer identifying a specific iteration of a
       (`model`, `scenario`). A new `version` is created by:
@@ -71,6 +72,7 @@ TimeSeries
       is_default
       last_update
       preload_timeseries
+      read_file
       remove_geodata
       remove_timeseries
       run_id
@@ -143,6 +145,7 @@ Scenario
       load_scenario_data
       par
       par_list
+      read_excel
       remove_par
       remove_set
       remove_solution
@@ -151,6 +154,7 @@ Scenario
       set_list
       set_meta
       solve
+      to_excel
       var
       var_list
 
@@ -165,10 +169,8 @@ When imported, :mod:`ixmp` reads configuration from the first file named
 
 1. The directory given by the environment variable ``IXMP_DATA``, if
    defined,
-2. ``${XDG_DATA_HOME}/ixmp``, if the environment variable is defined,
-3. ``$HOME/.local/share/ixmp``, or
-4. ``$HOME/.local/ixmp`` (deprecated; retained for compatibility with ixmp
-   <= 1.1).
+2. ``${XDG_DATA_HOME}/ixmp``, if the environment variable is defined, or
+3. ``$HOME/.local/share/ixmp``.
 
 .. tip::
    For most users, #2 or #3 is a sensible default; platform information for many local and remote databases can be stored in ``config.json`` and retrieved by name.
@@ -204,9 +206,8 @@ Utilities
 
 .. currentmodule:: ixmp.utils
 
-.. automethod:: ixmp.utils.parse_url
-
-.. automethod:: ixmp.utils.format_scenario_list
+.. automodule:: ixmp.utils
+   :members: format_scenario_list, parse_url, update_par
 
 
 Testing utilities
@@ -214,4 +215,6 @@ Testing utilities
 
 .. currentmodule:: ixmp.testing
 
-.. automethod:: ixmp.testing.make_dantzig
+.. automodule:: ixmp.testing
+   :members:
+   :exclude-members: pytest_report_header, pytest_sessionstart

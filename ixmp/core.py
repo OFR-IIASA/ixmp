@@ -1,18 +1,21 @@
 from functools import partial
 from itertools import repeat, zip_longest
 import logging
+from pathlib import Path
 from warnings import warn
 
+import numpy as np
 import pandas as pd
 
 from ._config import config
-from .backend import BACKENDS, FIELDS
+from .backend import BACKENDS, FIELDS, ItemType
 from .model import get_model
 from .utils import (
     as_str_list,
     check_year,
     logger,
-    parse_url
+    parse_url,
+    year_list
 )
 
 log = logging.getLogger(__name__)
@@ -36,10 +39,6 @@ class Platform:
     :class:`Scenario` objects tied to a single Platform; to move data between
     platforms, see :meth:`Scenario.clone`.
 
-    .. deprecated:: 2.0
-       Creating a Platform using positional arguments. Use the keyword
-       arguments `name` or `backend`, and optional `backend_args`.
-
     Parameters
     ----------
     name : str
@@ -58,7 +57,7 @@ class Platform:
         'close_db',
     ]
 
-    def __init__(self, *args, name=None, backend=None, **backend_args):
+    def __init__(self, name=None, backend=None, **backend_args):
         if name is None:
             if backend is None and not len(backend_args):
                 # No arguments given: use the default platform config
@@ -74,24 +73,6 @@ class Platform:
         if name:
             # Using a named platform config; retrieve it
             self.name, kwargs = config.get_platform_info(name)
-
-        if len(args):
-            # Handle deprecated positional arguments
-            if backend and backend != 'jdbc':
-                message = ('backend={!r} conflicts with deprecated positional '
-                           'arguments for JDBCBackend (dbprops, dbtype, '
-                           'jvmargs)').format(backend)
-                raise ValueError(message)
-            elif backend is None:
-                # Providing positional args implies JDBCBackend
-                kwargs['class'] = 'jdbc'
-
-            warn('positional arguments to Platform(…) for JDBCBackend. '
-                 'Use keyword arguments driver=, dbprops=, and/or jvmargs=',
-                 DeprecationWarning)
-
-            # Copy positional args to keyword args
-            backend_args.update(zip(['dbprops', 'dbtype', 'jvmargs'], args))
 
         # Overwrite any platform config with explicit keyword arguments
         kwargs.update(backend_args)
@@ -109,23 +90,36 @@ class Platform:
 
     def __getattr__(self, name):
         """Convenience for methods of Backend."""
-        return getattr(self._backend, name)
+        if name in self._backend_direct:
+            return getattr(self._backend, name)
+        else:
+            raise AttributeError(name)
 
     def set_log_level(self, level):
-        """Set global logger level.
+        """Set log level for the Platform and its storage :class:`.Backend`.
 
         Parameters
         ----------
         level : str
-            set the logger level if specified, see
-            https://docs.python.org/3/library/logging.html#logging-levels
+            Name of a :py:ref:`Python logging level <levels>`.
         """
         if level not in dir(logging):
             msg = '{} not a valid Python logger level, see ' + \
                 'https://docs.python.org/3/library/logging.html#logging-level'
             raise ValueError(msg.format(level))
+        log.setLevel(level)
         logger().setLevel(level)
         self._backend.set_log_level(level)
+
+    def get_log_level(self):
+        """Return log level of the storage :class:`.Backend`, if any.
+
+        Returns
+        -------
+        str
+            Name of a :py:ref:`Python logging level <levels>`.
+        """
+        return self._backend.get_log_level()
 
     def scenario_list(self, default=True, model=None, scen=None):
         """Return information about TimeSeries and Scenarios on the Platform.
@@ -144,7 +138,7 @@ class Platform:
 
         Returns
         -------
-        pandas.DataFrame
+        :class:`pandas.DataFrame`
             Scenario information, with the columns:
 
             - ``model``, ``scenario``, ``version``, and ``scheme``—Scenario
@@ -163,6 +157,52 @@ class Platform:
         """
         return pd.DataFrame(self._backend.get_scenarios(default, model, scen),
                             columns=FIELDS['get_scenarios'])
+
+    def export_timeseries_data(self, path, default=True, model=None,
+                               scenario=None, variable=None):
+        """Export timeseries data to CSV file across multiple scenarios.
+
+        Refer :meth:`.add_timeseries` of :class:`Timeseries` to get more
+        information about adding timeseries data to scenario.
+
+        Parameters
+        ----------
+        path : os.PathLike
+            File name to export data to; must have the suffix '.csv'.
+
+            Result file will contain the following columns:
+
+            - model
+            - scenario
+            - version
+            - variable
+            - unit
+            - region
+            - meta
+            - time
+            - year
+            - value
+        default : bool, optional
+            :obj:`True` to include only TimeSeries versions marked as default.
+        model: str, optional
+            Only return data for this model name.
+        scenario: str, optional
+            Only return data for this scenario name.
+        variable: list of str, optional
+            Only return data for variable name(s) in this list.
+
+        Returns
+        -------
+        None
+        """
+        filters = {
+            'model': model,
+            'scenario': scenario,
+            'variable': as_str_list(variable) or [],
+            'default': default
+        }
+
+        self._backend.write_file(path, ItemType.TS, filters=filters)
 
     def add_unit(self, unit, comment='None'):
         """Define a unit.
@@ -183,6 +223,12 @@ class Platform:
         self._backend.set_unit(unit, comment)
 
     def units(self):
+        """Return all units defined on the Platform.
+
+        Returns
+        -------
+        numpy.ndarray of str
+        """
         return self._backend.get_units()
 
     def regions(self):
@@ -195,6 +241,23 @@ class Platform:
         """
         return pd.DataFrame(self._backend.get_nodes(),
                             columns=FIELDS['get_nodes'])
+
+    def _existing_node(self, name):
+        """Check whether the node *name* has been defined.
+
+        If :obj:`True`, log a warning and return True. Otherwise, return False.
+        """
+        for _, r in self.regions().iterrows():
+            if r.region != name:
+                continue
+
+            log.warning(
+                f'region {name!r} is already defined on the Platform'
+                + (f' as a synonym for {r.mapped_to!r}' if r.mapped_to else '')
+                + (f' under parent {r.parent!r}' if r.parent else ''))
+            return True
+
+        return False
 
     def add_region(self, region, hierarchy, parent='World'):
         """Define a region including a hierarchy level and a 'parent' region.
@@ -213,12 +276,8 @@ class Platform:
         hierarchy : str
             Hierarchy level of the region (e.g., country, R11, basin)
         """
-        for r in self._backend.get_nodes():
-            if r[1] == region:
-                _logger_region_exists(self.regions(), region)
-                return
-
-        self._backend.set_node(region, parent, hierarchy)
+        if not self._existing_node(region):
+            self._backend.set_node(region, parent, hierarchy)
 
     def add_region_synonym(self, region, mapped_to):
         """Define a synonym for a `region`.
@@ -233,12 +292,62 @@ class Platform:
         mapped_to : str
             Name of the region to which the synonym should be mapped.
         """
-        for r in self._backend.get_nodes():
-            if r[1] == region:
-                _logger_region_exists(self.regions(), region)
-                return
+        if not self._existing_node(region):
+            self._backend.set_node(region, synonym=mapped_to)
 
-        self._backend.set_node(region, synonym=mapped_to)
+    def timeslices(self):
+        """Return all subannual timeslices defined in this Platform instance.
+
+        Timeslices are a way to represent subannual temporal resolution in
+        timeseries data. A timeslice consists of a **name** (e.g., 'january',
+        'summer'), a **category** (e.g., 'months', 'seasons'), and a
+        **duration** given relative to a full year.
+
+        The category and duration do not have any functional relevance within
+        the ixmp framework, but they may be useful for pre- or post-processing.
+        For example, they can be used to filter all timeslices of a certain
+        category (e.g., all months) from the :class:`pandas.DataFrame` returned
+        by this function or to aggregate subannual data to full-year results.
+
+        A timeslice is related to the index set 'time'
+        in a :class:`message_ix.Scenario` to indicate a subannual temporal
+        dimension. Alas, timeslices and set elements of time have to be
+        initialized/defined independently.
+
+        See :meth:`add_timeslice` to initialize additional timeslices in the
+        Platform instance.
+
+        Returns
+        -------
+        :class:`pandas.DataFrame`
+            DataFrame of timeslices, categories and duration
+        """
+        return pd.DataFrame(self._backend.get_timeslices(),
+                            columns=FIELDS['get_timeslices'])
+
+    def add_timeslice(self, name, category, duration):
+        """Define a subannual timeslice including a category and duration.
+
+        See :meth:`timeslices` for a detailed description of timeslices.
+
+        Parameters
+        ----------
+        name : str
+            Unique name of the timeslice.
+        category : str
+            Timeslice category (e.g. 'common', 'month', etc).
+        duration : float
+            Duration of timeslice as fraction of year.
+        """
+        slices = self.timeslices().set_index('name')
+        if name in slices.index:
+            msg = 'timeslice `{}` already defined with duration {}'
+            existing_duration = slices.loc[name].duration
+            if not np.isclose(duration, existing_duration):
+                raise ValueError(msg.format(name, existing_duration))
+            logger().info(msg.format(name, duration))
+        else:
+            self._backend.set_timeslice(name, category, duration)
 
     def check_access(self, user, models, access='view'):
         """Check access to specific models.
@@ -263,15 +372,6 @@ class Platform:
         else:
             return {model: result.get(model) == 1 for model in models_list}
 
-
-def _logger_region_exists(_regions, r):
-    region = _regions.set_index('region').loc[r]
-    msg = 'region `{}` is already defined in the platform instance'
-    if region['mapped_to'] is not None:
-        msg += ' as synonym for region `{}`'.format(region.mapped_to)
-    if region['parent'] is not None:
-        msg += ', as subregion of `{}`'.format(region.parent)
-    logger().info(msg.format(r))
 
 # %% class TimeSeries
 
@@ -308,7 +408,7 @@ class TimeSeries:
 
     def __init__(self, mp, model, scenario, version=None, annotation=None):
         if not isinstance(mp, Platform):
-            raise ValueError('mp is not a valid `ixmp.Platform` instance')
+            raise TypeError('mp is not a valid `ixmp.Platform` instance')
 
         # Set attributes
         self.platform = mp
@@ -326,15 +426,14 @@ class TimeSeries:
         """Convenience for calling *method* on the backend."""
         return self.platform._backend(self, method, *args, **kwargs)
 
+    # Transactions and versioning
     # functions for platform management
+    def has_solution(self):
+        # only Scenario class can have a solution
+        return False
 
     def check_out(self, timeseries_only=False):
         """Check out the TimeSeries for modification."""
-        if not timeseries_only and self.has_solution():
-            raise ValueError('This Scenario has a solution, '
-                             'use `Scenario.remove_solution()` or '
-                             '`Scenario.clone(..., keep_solution=False)`'
-                             )
         self._backend('check_out', timeseries_only)
 
     def commit(self, comment):
@@ -364,11 +463,11 @@ class TimeSeries:
         return self._backend('is_default')
 
     def last_update(self):
-        """get the timestamp of the last update/edit of this TimeSeries"""
+        """Get the timestamp of the last update/edit of this TimeSeries."""
         return self._backend('last_update')
 
     def run_id(self):
-        """get the run id of this TimeSeries"""
+        """Get the run id of this TimeSeries."""
         return self._backend('run_id')
 
     # functions for importing and retrieving timeseries data
@@ -378,7 +477,7 @@ class TimeSeries:
         """
         self._backend('preload')
 
-    def add_timeseries(self, df, meta=False):
+    def add_timeseries(self, df, meta=False, year_lim=(None, None)):
         """Add data to the TimeSeries.
 
         Parameters
@@ -395,37 +494,60 @@ class TimeSeries:
             - `year` and `value`—long, or 'tabular', format.
             - one or more specific years—wide, or 'IAMC' format.
 
+            To support subannual temporal resolution of timeseries data, a
+            column `subannual` is optional in `df`. The entries in this column
+            must have been defined in the Platform instance using
+            :meth:`add_timeslice` beforehand. If no column `subannual` is
+            included in `df`, the data is assumed to contain yearly values.
+            See :meth:`timeslices` for a detailed description of the feature.
+
         meta : bool, optional
             If :obj:`True`, store `df` as metadata. Metadata is treated
             specially when :meth:`Scenario.clone` is called for Scenarios
             created with ``scheme='MESSAGE'``.
+
+        year_lim : tuple of (int or None, int or None`), optional
+            Respectively, minimum and maximum years to add from *df*; data for
+            other years is ignored.
         """
         meta = bool(meta)
 
         # Ensure consistent column names
-        df = to_iamc_template(df)
+        df = to_iamc_layout(df)
 
         if 'value' in df.columns:
             # Long format; pivot to wide
-            df = pd.pivot_table(df,
-                                values='value',
-                                index=['region', 'variable', 'unit'],
-                                columns=['year'])
-        else:
-            # Wide format: set index columns
-            df.set_index(['region', 'variable', 'unit'], inplace=True)
+            all_cols = [i for i in df.columns if i not in ['year', 'value']]
+            df = pd.pivot_table(df, values='value', index=all_cols,
+                                columns=['year']).reset_index()
+        df.set_index(['region', 'variable', 'unit', 'subannual'], inplace=True)
 
-        # Discard non-numeric columns, e.g. 'model', 'scenario'
-        num_cols = [pd.api.types.is_numeric_dtype(dt) for dt in df.dtypes]
-        df = df.iloc[:, num_cols]
+        # Discard non-numeric columns, e.g. 'model', 'scenario',
+        # write warning about non-expected cols to log
+        year_cols = year_list(df.columns)
+        other_cols = [i for i in df.columns
+                      if i not in ['model', 'scenario'] + year_cols]
+        if len(other_cols) > 0:
+            logger().warning(f'dropping index columns {other_cols} from data')
+
+        df = df.loc[:, year_cols]
 
         # Columns (year) as integer
         df.columns = df.columns.astype(int)
 
+        # Identify columns to drop
+        to_drop = set()
+        if year_lim[0]:
+            to_drop |= set(filter(lambda y: y < year_lim[0], df.columns))
+        if year_lim[1]:
+            to_drop |= set(filter(lambda y: y > year_lim[1], df.columns))
+
+        df.drop(to_drop, axis=1, inplace=True)
+
         # Add one time series per row
-        for (r, v, u), data in df.iterrows():
+        for (r, v, u, sa), data in df.iterrows():
             # Values as float; exclude NA
-            self._backend('set_data', r, v, data.astype(float).dropna(), u,
+            self._backend('set_data', r, v, data.astype(float).dropna(), u, sa,
                           meta)
 
     def timeseries(self, region=None, variable=None, unit=None, year=None,
@@ -463,7 +585,8 @@ class TimeSeries:
 
         if iamc:
             # Convert to wide format
-            df = df.pivot_table(index=IAMC_IDX, columns='year')['value'] \
+            index = IAMC_IDX + ['subannual']
+            df = df.pivot_table(index=index, columns='year')['value'] \
                    .reset_index()
             df.columns.names = [None]
 
@@ -483,16 +606,18 @@ class TimeSeries:
             - `year`
         """
         # Ensure consistent column names
-        df = to_iamc_template(df)
+        df = to_iamc_layout(df)
 
+        id_cols = ['region', 'variable', 'unit', 'subannual']
         if 'year' not in df.columns:
             # Reshape from wide to long format
-            df = pd.melt(df, id_vars=['region', 'variable', 'unit'],
+            df = pd.melt(df,
+                         id_vars=id_cols,
                          var_name='year', value_name='value')
 
         # Remove all years for a given (r, v, u) combination at once
-        for (r, v, u), data in df.groupby(['region', 'variable', 'unit']):
-            self._backend('delete', r, v, data['year'].tolist(), u)
+        for (r, v, u, t), data in df.groupby(id_cols):
+            self._backend('delete', r, v, t, data['year'].tolist(), u)
 
     def add_geodata(self, df):
         """Add geodata (layers) to the TimeSeries.
@@ -504,14 +629,14 @@ class TimeSeries:
 
             - `region`
             - `variable`
-            - `time`
+            - `subannual`
             - `unit`
             - `year`
             - `value`
             - `meta`
         """
         for _, row in df.astype({'year': int, 'meta': int}).iterrows():
-            self._backend('set_geo', row.region, row.variable, row.time,
+            self._backend('set_geo', row.region, row.variable, row.subannual,
                           row.year, row.value, row.unit, row.meta)
 
     def remove_geodata(self, df):
@@ -525,12 +650,12 @@ class TimeSeries:
             - `region`
             - `variable`
             - `unit`
-            - `time`
+            - `subannual`
             - `year`
         """
         # Remove all years for a given (r, v, t, u) combination at once
-        for (r, v, t, u), data in df.groupby(['region', 'variable', 'time',
-                                              'unit']):
+        for (r, v, t, u), data in df.groupby(['region', 'variable',
+                                              'subannual', 'unit']):
             self._backend('delete_geo', r, v, t, data['year'].tolist(), u)
 
     def get_geodata(self):
@@ -541,8 +666,35 @@ class TimeSeries:
         :class:`pandas.DataFrame`
             Specified data.
         """
+        # TODO remove astype here; this is the responsibility of Backend
         return pd.DataFrame(self._backend('get_geo'),
-                            columns=FIELDS['ts_get_geo'])
+                            columns=FIELDS['ts_get_geo']) \
+                 .reset_index(drop=True) \
+                 .astype({'meta': 'int64', 'year': 'int64'})
+
+    def read_file(self, path, firstyear=None, lastyear=None):
+        """Read time series data from a CSV or Microsoft Excel file.
+
+        Parameters
+        ----------
+        path : os.PathLike
+            File to read. Must have suffix '.csv' or '.xlsx'.
+        firstyear : int, optional
+            Only read data from years equal to or later than this year.
+        lastyear : int, optional
+            Only read data from years equal to or earlier than this year.
+
+        See also
+        --------
+        .Scenario.read_excel
+        """
+        self.platform._backend.read_file(
+            Path(path),
+            ItemType.TS,
+            filters=dict(scenario=self),
+            firstyear=firstyear,
+            lastyear=lastyear,
+        )
 
 
 # %% class Scenario
@@ -565,12 +717,13 @@ class Scenario(TimeSeries):
     scheme = None
 
     def __init__(self, mp, model, scenario, version=None, scheme=None,
-                 annotation=None, cache=False):
+                 annotation=None, cache=False, **model_init_args):
         if not isinstance(mp, Platform):
-            raise ValueError('mp is not a valid `ixmp.Platform` instance')
+            raise TypeError('mp is not a valid `ixmp.Platform` instance')
 
         # Set attributes
         self.platform = mp
+        self.scheme = scheme
         self.model = model
         self.scenario = scenario
 
@@ -581,9 +734,15 @@ class Scenario(TimeSeries):
         else:
             raise ValueError(f'version={version!r}')
 
-        if self.scheme == 'MESSAGE' and not hasattr(self, 'is_message_scheme'):
-            warn('Using `ixmp.Scenario` for MESSAGE-scheme scenarios is '
-                 'deprecated, please use `message_ix.Scenario`')
+        if self.scheme == 'MESSAGE' and self.__class__ is Scenario:
+            raise RuntimeError(f'{model}/{scenario} is a MESSAGE-scheme '
+                               'scenario; use message_ix.Scenario().')
+
+        # Retrieve the Model class correlating to the *scheme*
+        model_class = get_model(scheme).__class__
+
+        # Use the model class to initialize the Scenario
+        model_class.initialize(self, **model_init_args)
 
     @property
     def _cache(self):
@@ -627,13 +786,22 @@ class Scenario(TimeSeries):
             scenario = cls(platform, **scenario_info)
         except Exception as e:
             if errors == 'warn':
-                log.warning('{}: {}\nwhen loading Scenario from url {}'
+                log.warning('{}: {}\nwhen loading Scenario from url: {!r}'
                             .format(e.__class__.__name__, e.args[0], url))
                 return None, platform
             else:
                 raise
         else:
             return scenario, platform
+
+    def check_out(self, timeseries_only=False):
+        """Check out the Scenario for modification."""
+        if not timeseries_only and self.has_solution():
+            raise ValueError('This Scenario has a solution, '
+                             'use `Scenario.remove_solution()` or '
+                             '`Scenario.clone(..., keep_solution=False)`'
+                             )
+        super().check_out(timeseries_only)
 
     def load_scenario_data(self):
         """Load all Scenario data into memory.
@@ -653,7 +821,7 @@ class Scenario(TimeSeries):
                 get_func(name)
 
     def idx_sets(self, name):
-        """Return the list of index sets for an item (set, par, var, equ)
+        """Return the list of index sets for an item (set, par, var, equ).
 
         Parameters
         ----------
@@ -663,7 +831,7 @@ class Scenario(TimeSeries):
         return self._backend('item_index', name, 'sets')
 
     def idx_names(self, name):
-        """return the list of index names for an item (set, par, var, equ)
+        """Return the list of index names for an item (set, par, var, equ).
 
         Parameters
         ----------
@@ -700,9 +868,9 @@ class Scenario(TimeSeries):
         ----------
         name : str
             Name of the set.
-        idx_sets : list of str, optional
+        idx_sets : list of str or str, optional
             Names of other sets that index this set.
-        idx_names : list of str, optional
+        idx_names : list of str or str, optional
             Names of the dimensions indexed by `idx_sets`.
 
         Raises
@@ -713,6 +881,8 @@ class Scenario(TimeSeries):
             If the Scenario is not checked out (see
             :meth:`~TimeSeries.check_out`).
         """
+        idx_sets = as_str_list(idx_sets) or []
+        idx_names = as_str_list(idx_names)
         return self._backend('init_item', 'set', name, idx_sets, idx_names)
 
     def set(self, name, filters=None, **kwargs):
@@ -730,7 +900,7 @@ class Scenario(TimeSeries):
 
         Returns
         -------
-        pandas.DataFrame
+        :class:`pandas.DataFrame`
         """
         return self._backend('item_get_elements', 'set', name, filters)
 
@@ -758,6 +928,9 @@ class Scenario(TimeSeries):
         """
         # TODO expand docstring (here or in doc/source/api.rst) with examples,
         #      per test_core.test_add_set.
+
+        if isinstance(key, list) and len(key) == 0:
+            return  # No elements to add
 
         # Get index names for set *name*, may raise KeyError
         idx_names = self.idx_names(name)
@@ -837,15 +1010,15 @@ class Scenario(TimeSeries):
         self._backend('item_set_elements', 'set', name, elements)
 
     def remove_set(self, name, key=None):
-        """delete a set from the scenario
-        or remove an element from a set (if key is specified)
+        """Delete set elements or an entire set.
 
         Parameters
         ----------
         name : str
-            name of the set
-        key : dataframe or key list or concatenated string
-            elements to be removed
+            Name of the set to remove (if `key` is :obj:`None`) or from which
+            to remove elements.
+        key : :class:`pandas.DataFrame` or list of str, optional
+            Elements to be removed from set `name`.
         """
         if key is None:
             self._backend('delete_item', 'set', name)
@@ -858,7 +1031,7 @@ class Scenario(TimeSeries):
         return self._backend('list_items', 'par')
 
     def has_par(self, name):
-        """check whether the scenario has a parameter with that name"""
+        """Check whether the scenario has a parameter with that name."""
         return name in self.par_list()
 
     def init_par(self, name, idx_sets, idx_names=None):
@@ -868,11 +1041,13 @@ class Scenario(TimeSeries):
         ----------
         name : str
             Name of the parameter.
-        idx_sets : list of str
+        idx_sets : list of str or str, optional
             Names of sets that index this parameter.
-        idx_names : list of str, optional
+        idx_names : list of str or str, optional
             Names of the dimensions indexed by `idx_sets`.
         """
+        idx_sets = as_str_list(idx_sets) or []
+        idx_names = as_str_list(idx_names)
         return self._backend('init_item', 'par', name, idx_sets, idx_names)
 
     def par(self, name, filters=None, **kwargs):
@@ -899,8 +1074,8 @@ class Scenario(TimeSeries):
         ----------
         name : str
             Name of the parameter.
-        key_or_data : str or iterable of str or range or dict or \
-                      pandas.DataFrame
+        key_or_data : str or iterable of str or range or dict or
+                      :class:`pandas.DataFrame`
             Element(s) to be added.
         value : numeric or iterable of numeric, optional
             Values.
@@ -1000,7 +1175,7 @@ class Scenario(TimeSeries):
         comment : str, optional
             Description of the scalar.
         """
-        self.init_par(name, None, None)
+        self.init_par(name, [], [])
         self.change_scalar(name, val, unit, comment)
 
     def scalar(self, name):
@@ -1055,25 +1230,27 @@ class Scenario(TimeSeries):
         return self._backend('list_items', 'var')
 
     def has_var(self, name):
-        """check whether the scenario has a variable with that name"""
+        """Check whether the scenario has a variable with that name."""
         return name in self.var_list()
 
     def init_var(self, name, idx_sets=None, idx_names=None):
-        """initialize a new variable in the scenario
+        """Initialize a new variable.
 
         Parameters
         ----------
         name : str
-            name of the item
-        idx_sets : list of str
-            index set list
-        idx_names : list of str, optional
-            index name list
+            Name of the variable.
+        idx_sets : list of str or str, optional
+            Name(s) of index sets for a 1+-dimensional variable.
+        idx_names : list of str or str, optional
+            Names of the dimensions indexed by `idx_sets`.
         """
+        idx_sets = as_str_list(idx_sets) or []
+        idx_names = as_str_list(idx_names)
         return self._backend('init_item', 'var', name, idx_sets, idx_names)
 
     def var(self, name, filters=None, **kwargs):
-        """return a dataframe of (filtered) elements for a specific variable
+        """Return a dataframe of (filtered) elements for a specific variable.
 
         Parameters
         ----------
@@ -1094,20 +1271,22 @@ class Scenario(TimeSeries):
         Parameters
         ----------
         name : str
-            name of the item
-        idx_sets : list of str
-            index set list
-        idx_names : list of str, optional
-            index name list
+            Name of the equation.
+        idx_sets : list of str or str, optional
+            Name(s) of index sets for a 1+-dimensional variable.
+        idx_names : list of str or str, optional
+            Names of the dimensions indexed by `idx_sets`.
         """
+        idx_sets = as_str_list(idx_sets) or []
+        idx_names = as_str_list(idx_names)
         return self._backend('init_item', 'equ', name, idx_sets, idx_names)
 
     def has_equ(self, name):
-        """check whether the scenario has an equation with that name"""
+        """Check whether the scenario has an equation with that name."""
         return name in self.equ_list()
 
     def equ(self, name, filters=None, **kwargs):
-        """return a dataframe of (filtered) elements for a specific equation
+        """Return a dataframe of (filtered) elements for a specific equation.
 
         Parameters
         ----------
@@ -1119,8 +1298,7 @@ class Scenario(TimeSeries):
         return self._backend('item_get_elements', 'equ', name, filters)
 
     def clone(self, model=None, scenario=None, annotation=None,
-              keep_solution=True, shift_first_model_year=None, platform=None,
-              **kwargs):
+              keep_solution=True, shift_first_model_year=None, platform=None):
         """Clone the current scenario and return the clone.
 
         If the (`model`, `scenario`) given already exist on the
@@ -1154,34 +1332,7 @@ class Scenario(TimeSeries):
             cloned for all years.
         platform : :class:`Platform`, optional
             Platform to clone to (default: current platform)
-        scen : str, optional
-            .. deprecated:: 2.0
-               Use `scenario`.
-        keep_sol : bool, optional
-            .. deprecated:: 2.0
-               Use `keep_solution`.
-        first_model_year : int, optional
-            .. deprecated:: 2.0
-               Use `shift_first_model_year`.
         """
-        if 'keep_sol' in kwargs:
-            warn('`keep_sol` is deprecated and will be removed in the next'
-                 ' release, please use `keep_solution`')
-            keep_solution = kwargs.pop('keep_sol')
-
-        if 'scen' in kwargs:
-            warn('`scen` is deprecated and will be removed in the next'
-                 ' release, please use `scenario`')
-            scenario = kwargs.pop('scen')
-
-        if 'first_model_year' in kwargs:
-            warn('`first_model_year` is deprecated and will be removed in the'
-                 ' next release. Use `shift_first_model_year`.')
-            shift_first_model_year = kwargs.pop('first_model_year')
-
-        if len(kwargs):
-            raise ValueError('Invalid arguments {!r}'.format(kwargs))
-
         if shift_first_model_year is not None:
             if keep_solution:
                 logger().warning('Overriding keep_solution=True for '
@@ -1282,7 +1433,7 @@ class Scenario(TimeSeries):
                              'use `remove_solution()` first!')
 
         # Instantiate a model
-        model = get_model(model, **model_options)
+        model = get_model(model or self.scheme, **model_options)
 
         # Validate *callback* argument
         if callback is not None and not callable(callback):
@@ -1319,7 +1470,7 @@ class Scenario(TimeSeries):
                 break
 
     def get_meta(self, name=None):
-        """get scenario metadata
+        """Get scenario metadata.
 
         Parameters
         ----------
@@ -1330,7 +1481,7 @@ class Scenario(TimeSeries):
         return all_meta[name] if name else all_meta
 
     def set_meta(self, name, value):
-        """set scenario metadata
+        """Set scenario metadata.
 
         Parameters
         ----------
@@ -1341,11 +1492,63 @@ class Scenario(TimeSeries):
         """
         self._backend('set_meta', name, value)
 
+    # Input and output
+    def to_excel(self, path):
+        """Write Scenario to a Microsoft Excel file.
 
-# %% auxiliary functions for class Scenario
+        Parameters
+        ----------
+        path : os.PathLike
+            File to write. Must have suffix '.xlsx'.
 
-def to_iamc_template(df):
-    """Format pd.DataFrame *df* in IAMC style.
+        See also
+        --------
+        :ref:`excel-data-format`
+        read_excel
+        """
+        self.platform._backend.write_file(Path(path), ItemType.MODEL,
+                                          filters=dict(scenario=self))
+
+    def read_excel(self, path, add_units=False, init_items=False,
+                   commit_steps=False):
+        """Read a Microsoft Excel file into the Scenario.
+
+        Parameters
+        ----------
+        path : os.PathLike
+            File to read. Must have suffix '.xlsx'.
+        add_units : bool, optional
+            Add missing units, if any, to the Platform instance.
+        init_items : bool, optional
+            Initialize sets and parameters that do not already exist in the
+            Scenario.
+        commit_steps : bool, optional
+            Commit changes after every data addition.
+
+        See also
+        --------
+        :ref:`excel-data-format`
+        .TimeSeries.read_file
+        to_excel
+        """
+        self.platform._backend.read_file(
+            Path(path),
+            ItemType.MODEL,
+            filters=dict(scenario=self),
+            add_units=add_units,
+            init_items=init_items,
+            commit_steps=commit_steps,
+        )
+
+
+def to_iamc_layout(df):
+    """Transform *df* to a standard IAMC layout.
+
+    The returned object has:
+
+    - Any (Multi)Index levels reset as columns.
+    - Lower-case column names 'region', 'variable', 'subannual', and 'unit'.
+    - If not present in *df*, the value 'Year' in the 'subannual' column.
 
     Parameters
     ----------
@@ -1355,32 +1558,28 @@ def to_iamc_template(df):
     Returns
     -------
     pandas.DataFrame
-        The returned object has:
-
-        - Any (Multi)Index levels reset as columns.
-        - Lower-case column names 'region', 'variable', and 'unit'.
 
     Raises
     ------
     ValueError
-        If 'time' is among the column names; or 'region', 'variable', or 'unit'
-        is not.
+        If 'region', 'variable', or 'unit' is not among the column names.
     """
-    if 'time' in df.columns:
-        raise ValueError('sub-annual time slices not supported by '
-                         'ixmp.TimeSeries')
-
-    # reset the index if meaningful entries are included there
+    # Reset the index if meaningful entries are included there
     if not list(df.index.names) == [None]:
         df.reset_index(inplace=True)
 
-    # rename columns to standard notation
+    # Rename columns in lower case, and transform 'node' to 'region'
     cols = {c: str(c).lower() for c in df.columns}
     cols.update(node='region')
     df = df.rename(columns=cols)
+
     required_cols = ['region', 'variable', 'unit']
-    if not set(required_cols).issubset(set(df.columns)):
-        missing = list(set(required_cols) - set(df.columns))
-        raise ValueError("missing required columns `{}`!".format(missing))
+    missing = list(set(required_cols) - set(df.columns))
+    if len(missing):
+        raise ValueError(f'missing required columns {missing!r}')
+
+    # Add a column 'subannual' with the default value
+    if 'subannual' not in df.columns:
+        df['subannual'] = 'Year'
 
     return df

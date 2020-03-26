@@ -4,8 +4,6 @@ import re
 from urllib.parse import urlparse
 
 import pandas as pd
-import six
-from pathlib import Path
 
 
 # globally accessible logger
@@ -38,24 +36,17 @@ def as_str_list(arg, idx_names=None):
         return None
     elif idx_names is None:
         # arg must be iterable
-        return list(map(str, arg)) if islistable(arg) else [str(arg)]
+        if isinstance(arg, Iterable) and not isinstance(arg, str):
+            return list(map(str, arg))
+        else:
+            return [str(arg)]
     else:
         return [str(arg[idx]) for idx in idx_names]
 
 
-def isstr(x):
-    """Returns True if x is a string"""
-    return isinstance(x, six.string_types)
-
-
 def isscalar(x):
     """Returns True if x is a scalar"""
-    return not isinstance(x, Iterable) or isstr(x)
-
-
-def islistable(x):
-    """Returns True if x is a list but not a string"""
-    return isinstance(x, Iterable) and not isstr(x)
+    return not isinstance(x, Iterable) or isinstance(x, str)
 
 
 def check_year(y, s):
@@ -127,38 +118,16 @@ def parse_url(url):
     return platform_info, scenario_info
 
 
-def pd_read(f, *args, **kwargs):
-    """Try to read a file with pandas, no fancy stuff"""
-    f = Path(f)
-    if f.suffix == '.csv':
-        return pd.read_csv(f, *args, **kwargs)
-    else:
-        return pd.read_excel(f, *args, **kwargs)
-
-
-def pd_write(df, f, *args, **kwargs):
-    """Try to write one or more dfs with pandas, no fancy stuff"""
-    f = Path(f)
-    is_pd = isinstance(df, (pd.DataFrame, pd.Series))
-    if f.suffix == '.csv':
-        if not is_pd:
-            raise ValueError('Must pass a Dataframe if using csv files')
-        df.to_csv(f, *args, **kwargs)
-    else:
-        writer = pd.ExcelWriter(f, engine='xlsxwriter')
-        if is_pd:
-            sheet_name = kwargs.pop('sheet_name', 'Sheet1')
-            df = {sheet_name: df}
-        for k, v in df.items():
-            v.to_excel(writer, sheet_name=k, *args, **kwargs)
-        writer.save()
-
-
-def numcols(df):
-    """Return the indices of the numeric columns of *df*."""
-    dtypes = df.dtypes
-    return [i for i in dtypes.index
-            if dtypes.loc[i].name.startswith(('float', 'int'))]
+def year_list(x):
+    """Return the elements of x that can be cast to year (int)."""
+    lst = []
+    for i in x:
+        try:
+            int(i)  # this is a year
+            lst.append(i)
+        except ValueError:
+            pass
+    return lst
 
 
 def filtered(df, filters):
@@ -171,31 +140,6 @@ def filtered(df, filters):
         isin = df[k].isin(as_str_list(v))
         mask = mask & isin
     return df[mask]
-
-
-def import_timeseries(scenario, data, firstyear=None, lastyear=None):
-    """Import from a *data* file into *scenario*."""
-    df = pd_read(data)
-    df = df.rename(columns={c: str(c).lower() for c in df.columns})
-
-    cols = numcols(df)
-    years = [int(i) for i in cols]
-    fyear = int(firstyear or min(years))
-    lyear = int(lastyear or max(years))
-    cols = [c for c in cols if int(c) >= fyear and int(c) <= lyear]
-    df = df[['region', 'variable', 'unit'] + cols]
-    df.region = [x if x == 'World' else 'R11_' + x for x in df.region]
-
-    scenario.check_out(timeseries_only=True)
-    scenario.add_timeseries(df)
-
-    annot = 'adding timeseries data from file {}'.format(data)
-    if firstyear is not None:
-        annot = '{} from {}'.format(annot, firstyear)
-    if lastyear is not None:
-        annot = '{} until {}'.format(annot, lastyear)
-
-    scenario.commit(annot)
 
 
 def format_scenario_list(platform, model=None, scenario=None, match=None,
@@ -254,6 +198,10 @@ def format_scenario_list(platform, model=None, scenario=None, match=None,
         .apply(describe) \
         .reset_index()
 
+    if not len(info):
+        # No results; re-create a minimal empty data frame
+        info = pd.DataFrame([], columns=['model', 'scenario', 'default', 'N'])
+
     info['scenario'] = info['scenario'] \
         .str.cat(info['default'].astype(str), sep='#')
 
@@ -261,16 +209,15 @@ def format_scenario_list(platform, model=None, scenario=None, match=None,
         info = info[info['model'].str.match(match)
                     | info['scenario'].str.match(match)]
 
+    lines = []
+
     if as_url:
         info['url'] = 'ixmp://{}'.format(platform.name)
         urls = info['url'].str.cat([info['model'], info['scenario']], sep='/')
         lines = urls.tolist()
     else:
-        lines = []
-
-        if len(info):
-            info['scenario'] = info['scenario'] \
-                .str.ljust(info['scenario'].str.len().max())
+        width = 0 if not len(info) else info['scenario'].str.len().max()
+        info['scenario'] = info['scenario'].str.ljust(width)
 
         for model, m_info in info.groupby(['model']):
             lines.extend([
@@ -279,10 +226,11 @@ def format_scenario_list(platform, model=None, scenario=None, match=None,
                 '  ' + '\n  '.join(m_info['scenario'].str.cat(m_info['range']))
             ])
 
+        lines.append('')
+
     # Summary information
     if not as_url:
         lines.extend([
-            '',
             str(len(info['model'].unique())) + ' model name(s)',
             str(len(info['scenario'].unique())) + ' scenario name(s)',
             str(len(info)) + ' (model, scenario) combination(s)',
@@ -290,3 +238,16 @@ def format_scenario_list(platform, model=None, scenario=None, match=None,
         ])
 
     return lines
+
+
+def update_par(scenario, name, data):
+    """Update parameter *name* in *scenario* using *data*, without overwriting.
+
+    Only values which do not already appear in the parameter data are added.
+    """
+    tmp = pd.concat([scenario.par(name), data])
+    columns = list(filter(lambda c: c != 'value', tmp.columns))
+    tmp = tmp.drop_duplicates(subset=columns, keep=False)
+
+    if len(tmp):
+        scenario.add_par(name, tmp)

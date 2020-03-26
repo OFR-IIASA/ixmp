@@ -1,38 +1,37 @@
 from copy import copy
 from collections import ChainMap
 from collections.abc import Collection, Iterable
-from functools import lru_cache
 from itertools import chain
 import logging
 import os
 from pathlib import Path, PurePosixPath
 import re
 from types import SimpleNamespace
-from warnings import warn
 
 import jpype
 from jpype import JClass
-import numpy as np
 import pandas as pd
 
-from ixmp import config
 from ixmp.core import Scenario
-from ixmp.utils import as_str_list, filtered, islistable
-from . import FIELDS
+from ixmp.utils import as_str_list, filtered
+from . import FIELDS, ItemType
 from .base import CachingBackend
 
 
 log = logging.getLogger(__name__)
 
 
+_EXCEPTION_VERBOSE = os.environ.get('IXMP_JDBC_EXCEPTION_VERBOSE', '0') == '1'
+
 # Map of Python to Java log levels
+# https://logging.apache.org/log4j/2.x/log4j-api/apidocs/org/apache/logging/log4j/Level.html
 LOG_LEVELS = {
-    'CRITICAL': 'ALL',
+    'CRITICAL': 'FATAL',
     'ERROR': 'ERROR',
     'WARNING': 'WARN',
     'INFO': 'INFO',
     'DEBUG': 'DEBUG',
-    'NOTSET': 'OFF',
+    'NOTSET': 'ALL',
 }
 
 # Java classes, loaded by start_jvm(). These become available as e.g.
@@ -42,7 +41,7 @@ java = SimpleNamespace()
 JAVA_CLASSES = [
     'at.ac.iiasa.ixmp.exceptions.IxException',
     'at.ac.iiasa.ixmp.objects.Scenario',
-    'at.ac.iiasa.ixmp.objects.TimeSeries.TimeSpan',
+    'at.ac.iiasa.ixmp.dto.TimesliceDTO',
     'at.ac.iiasa.ixmp.Platform',
     'java.lang.Double',
     'java.lang.Integer',
@@ -76,7 +75,7 @@ def _create_properties(driver=None, path=None, url=None, user=None,
         if url is None or path is not None:
             raise ValueError("use JDBCBackend(driver='oracle', url=…)")
 
-        full_url = 'jdbc:oracle:thin:@{}'.format(url)
+        full_url = f'jdbc:oracle:thin:@{url}'
     elif driver == 'hsqldb':
         if path is None and url is None:
             raise ValueError("use JDBCBackend(driver='hsqldb', path=…)")
@@ -91,7 +90,7 @@ def _create_properties(driver=None, path=None, url=None, user=None,
             # URL spec
             url_path = (str(PurePosixPath(Path(path).resolve()))
                         .replace('\\', ''))
-            full_url = 'jdbc:hsqldb:file:{}'.format(url_path)
+            full_url = f'jdbc:hsqldb:file:{url_path}'
         user = user or 'ixmp'
         password = password or 'ixmp'
 
@@ -110,6 +109,15 @@ def _read_properties(file):
         if match is not None:
             properties[match.group(1)] = match.group(2)
     return properties
+
+
+def _raise_jexception(exc, msg='unhandled Java exception: '):
+    """Convert Java/JPype exceptions to ordinary Python RuntimeError."""
+    if _EXCEPTION_VERBOSE:
+        msg += '\n\n' + exc.stacktrace()
+    else:
+        msg += exc.message()
+    raise RuntimeError(msg) from None
 
 
 class JDBCBackend(CachingBackend):
@@ -133,14 +141,7 @@ class JDBCBackend(CachingBackend):
         Java Virtual Machine arguments. See :meth:`.start_jvm`.
     dbprops : path-like, optional
         With ``driver='oracle'``, the path to a database properties file
-        containing `driver`, `url`, `user`, and `password` information
-
-        .. deprecated:: 2.0
-           With ``driver='hsqldb'``, the path to a local database, excluding
-           the '.lobs' suffix.
-    dbtype : str, optional
-        .. deprecated:: 2.0
-           Use `driver`.
+        containing `driver`, `url`, `user`, and `password` information.
     """
     # NB Much of the code of this backend is in Java, in the iiasa/ixmp_source
     #    Github repository.
@@ -167,21 +168,6 @@ class JDBCBackend(CachingBackend):
         properties = None
 
         # Handle arguments
-        if 'dbtype' in kwargs:
-            warn("'dbtype' argument to JDBCBackend; use 'driver'",
-                 DeprecationWarning)
-
-            if 'driver' in kwargs:
-                message = ('ambiguous: both driver={driver!r} and '
-                           'dbtype={!r}').format(**kwargs)
-                raise ValueError(message)
-            elif len(kwargs) == 1 and kwargs['dbtype'].lower() == 'hsqldb':
-                log.info("using platform 'local' for dbtype='hsqldb'")
-                _, kwargs = config.get_platform_info('local')
-                assert kwargs.pop('class') == 'jdbc'
-            else:
-                kwargs['driver'] = kwargs.pop('dbtype').lower()
-
         if 'dbprops' in kwargs:
             # Use an existing file
             dbprops = Path(kwargs.pop('dbprops'))
@@ -190,13 +176,6 @@ class JDBCBackend(CachingBackend):
                 properties = _read_properties(dbprops)
                 if 'jdbc.url' not in properties:
                     raise ValueError('Config file contains no database URL')
-            elif (not dbprops.exists()
-                  and dbprops.with_suffix('.lobs').exists()):
-                # Actually the basename for a HSQLDB
-                warn("Specifying driver='hsqldb' location with 'dbprops'; use"
-                     "'path'", DeprecationWarning)
-                kwargs.setdefault('driver', 'hsqldb')
-                kwargs.setdefault('path', dbprops)
             else:
                 raise FileNotFoundError(dbprops)
 
@@ -210,7 +189,11 @@ class JDBCBackend(CachingBackend):
             properties = new_props
         else:
             # ...from arguments
-            properties = _create_properties(**kwargs)
+            try:
+                properties = _create_properties(**kwargs)
+            except TypeError as e:
+                msg = e.args[0].replace('_create_properties', 'JDBCBackend')
+                raise TypeError(msg)
 
         log.info('launching ixmp.Platform connected to {}'
                  .format(properties.getProperty('jdbc.url')))
@@ -218,22 +201,18 @@ class JDBCBackend(CachingBackend):
         try:
             self.jobj = java.Platform('Python', properties)
         except java.NoClassDefFoundError as e:  # pragma: no cover
-            raise NameError(
-                '{}\nCheck that dependencies of ixmp.jar are included in {}'
-                .format(e, Path(__file__).parents[2] / 'lib'))
+            raise NameError(f'{e}\nCheck that dependencies of ixmp.jar are '
+                            f"included in {Path(__file__).parents[2] / 'lib'}")
         except jpype.JException as e:  # pragma: no cover
             # Handle Java exceptions
             jclass = e.__class__.__name__
-            info = '\n{}\n(Java: {})'.format(e, jclass)
             if jclass.endswith('HikariPool.PoolInitializationException'):
                 redacted = copy(kwargs)
                 redacted.update({'user': '(HIDDEN)', 'password': '(HIDDEN)'})
-                raise RuntimeError('unable to connect to database:\n{!r}{}'
-                                   .format(redacted, info)) from None
+                msg = f'unable to connect to database:\n{redacted!r}'
             elif jclass.endswith('FlywayException'):
-                raise RuntimeError('when initializing database:' + info)
-            else:
-                raise RuntimeError('unhandled Java exception:' + info) from e
+                msg = f'when initializing database:'
+            _raise_jexception(e, f'{msg}\n(Java: {jclass})')
 
         # Invoke the parent constructor to initialize the cache
         super().__init__()
@@ -242,6 +221,10 @@ class JDBCBackend(CachingBackend):
 
     def set_log_level(self, level):
         self.jobj.setLogLevel(LOG_LEVELS[level])
+
+    def get_log_level(self):
+        levels = {v: k for k, v in LOG_LEVELS.items()}
+        return levels.get(self.jobj.getLogLevel(), 'UNKNOWN')
 
     def open_db(self):
         """(Re-)open the database connection."""
@@ -264,7 +247,7 @@ class JDBCBackend(CachingBackend):
                 log.warning(str(e))
 
     def get_auth(self, user, models, kind):
-        return self.jobj.checkModelAccess(user, kind, to_jlist2(models))
+        return self.jobj.checkModelAccess(user, kind, to_jlist(models))
 
     def set_node(self, name, parent=None, hierarchy=None, synonym=None):
         if parent and hierarchy and not synonym:
@@ -277,6 +260,15 @@ class JDBCBackend(CachingBackend):
             n, p, h = r.getName(), r.getParent(), r.getHierarchy()
             yield (n, None, p, h)
             yield from [(s, n, p, h) for s in (r.getSynonyms() or [])]
+
+    def get_timeslices(self):
+        for r in self.jobj.getTimeslices():
+            name, category, duration = (r.getName(), r.getCategory(),
+                                        r.getDuration())
+            yield name, category, duration
+
+    def set_timeslice(self, name, category, duration):
+        self.jobj.addTimeslice(name, category, java.Double(duration))
 
     def get_scenarios(self, default, model, scenario):
         # List<Map<String, Object>>
@@ -293,6 +285,125 @@ class JDBCBackend(CachingBackend):
 
     def get_units(self):
         return to_pylist(self.jobj.getUnitList())
+
+    def read_file(self, path, item_type: ItemType, **kwargs):
+        """Read Platform, TimeSeries, or Scenario data from file.
+
+        JDBCBackend supports reading from:
+
+        - ``path='*.gdx', item_type=ItemType.MODEL``. The keyword arguments
+          `check_solution`, `comment`, `equ_list`, and `var_list` are
+          **required**.
+
+        Other parameters
+        ----------------
+        check_solution : bool
+            If True, raise an exception if the GAMS solver did not reach
+            optimality. (Only for MESSAGE-scheme Scenarios.)
+        comment : str
+            Comment added to Scenario when importing the solution.
+        equ_list : list of str
+            Equations to be imported.
+        var_list : list of str
+            Variables to be imported.
+        filters : dict of dict of str
+            Restrict items read.
+
+        See also
+        --------
+        .Backend.read_file
+        """
+        try:
+            # Call the default implementation, e.g. for .xlsx
+            super().read_file(path, item_type, **kwargs)
+        except NotImplementedError:
+            pass
+        else:
+            return
+
+        ts, filters = self._handle_rw_filters(kwargs.pop('filters', {}))
+        if path.suffix == '.gdx' and item_type is ItemType.MODEL:
+            kw = {'check_solution', 'comment', 'equ_list', 'var_list'}
+
+            if not isinstance(ts, Scenario):
+                raise ValueError('read from GDX requires a Scenario object')
+            elif set(kwargs.keys()) != kw:
+                raise ValueError(f'keyword arguments {kwargs.keys()} do not '
+                                 f'match required {kw}')
+
+            args = (
+                str(path.parent),
+                path.name,
+                kwargs.pop('comment'),
+                to_jlist(kwargs.pop('var_list')),
+                to_jlist(kwargs.pop('equ_list')),
+                kwargs.pop('check_solution'),
+            )
+
+            if len(kwargs):
+                raise ValueError(f'extra keyword arguments {kwargs}')
+
+            self.jindex[ts].readSolutionFromGDX(*args)
+
+            self.cache_invalidate(ts)
+        else:
+            raise NotImplementedError(path, item_type)
+
+    def write_file(self, path, item_type: ItemType, **kwargs):
+        """Write Platform, TimeSeries, or Scenario data to file.
+
+        JDBCBackend supports writing to:
+
+        - ``path='*.gdx', item_type=ItemType.SET | ItemType.PAR``.
+        - ``path='*.csv', item_type=TS``. The `default` keyword argument is
+          **required**.
+
+        Other parameters
+        ----------------
+        filters : dict of dict of str
+            Restrict items written. The following filters may be used:
+
+            - model : str
+            - scenario : str
+            - variable : list of str
+            - default : bool. If :obj:`True`, only data from TimeSeries
+              versions with :meth:`set_default` are written.
+
+        See also
+        --------
+        .Backend.write_file
+        """
+        try:
+            # Call the default implementation, e.g. for .xlsx
+            super().write_file(path, item_type, **kwargs)
+        except NotImplementedError:
+            pass
+        else:
+            return
+
+        ts, filters = self._handle_rw_filters(kwargs.pop('filters', {}))
+        if path.suffix == '.gdx' and item_type is ItemType.SET | ItemType.PAR:
+            if len(filters):
+                raise NotImplementedError('write to GDX with filters')
+            elif not isinstance(ts, Scenario):
+                raise ValueError('write to GDX requires a Scenario object')
+
+            # include_var_equ=False -> do not include variables/equations in
+            # GDX
+            self.jindex[ts].toGDX(str(path.parent), path.name, False)
+        elif path.suffix == '.csv' and item_type is ItemType.TS:
+            model = filters.pop('model')
+            scenario = filters.pop('scenario')
+            variables = filters.pop('variable')
+            default = filters.pop('default')
+
+            scen_list = self.jobj.getScenarioList(default, model, scenario)
+            run_ids = [s['run_id'] for s in scen_list]
+            self.jobj.exportTimeseriesData(to_jlist(run_ids),
+                                           to_jlist(variables),
+                                           str(path))
+        else:
+            raise NotImplementedError
 
     # Timeseries methods
 
@@ -322,7 +433,15 @@ class JDBCBackend(CachingBackend):
         try:
             jobj = method(*args)
         except java.IxException as e:
-            raise RuntimeError(*e.args)
+            # Try to re-raise as a ValueError for bad model or scenario name
+            match = re.search(r"table '([^']*)' from the database", e.args[0])
+            if match:
+                param = match.group(1).lower()
+                if param in ('model', 'scenario'):
+                    raise ValueError(f'{param}={getattr(ts, param)!r}')
+
+            # Failed
+            _raise_jexception(e)
 
         # Add to index
         self.jindex[ts] = jobj
@@ -341,10 +460,16 @@ class JDBCBackend(CachingBackend):
             ts.scheme = jobj.getScheme()
 
     def check_out(self, ts, timeseries_only):
-        self.jindex[ts].checkOut(timeseries_only)
+        try:
+            self.jindex[ts].checkOut(timeseries_only)
+        except java.IxException as e:
+            _raise_jexception(e)
 
     def commit(self, ts, comment):
-        self.jindex[ts].commit(comment)
+        try:
+            self.jindex[ts].commit(comment)
+        except java.IxException as e:
+            _raise_jexception(e)
         if ts.version == 0:
             ts.version = self.jindex[ts].getVersion()
 
@@ -358,7 +483,11 @@ class JDBCBackend(CachingBackend):
         return bool(self.jindex[ts].isDefault())
 
     def last_update(self, ts):
-        return self.jindex[ts].getLastUpdateTimestamp().toString()
+        timestamp = self.jindex[ts].getLastUpdateTimestamp()
+        if timestamp:
+            timestamp.toString()
+        else:
+            return timestamp  # None
 
     def run_id(self, ts):
         return self.jindex[ts].getRunId()
@@ -368,10 +497,10 @@ class JDBCBackend(CachingBackend):
 
     def get_data(self, ts, region, variable, unit, year):
         # Convert the selectors to Java lists
-        r = to_jlist2(region)
-        v = to_jlist2(variable)
-        u = to_jlist2(unit)
-        y = to_jlist2(year)
+        r = to_jlist(region)
+        v = to_jlist(variable)
+        u = to_jlist(unit)
+        y = to_jlist(year)
 
         # Field types
         ftype = {
@@ -393,7 +522,6 @@ class JDBCBackend(CachingBackend):
         # Field types
         ftype = {
             'meta': int,
-            'time': lambda ord: timespans()[int(ord)],  # Look up the name
             'year': lambda obj: obj,  # Pass through; handled later
         }
 
@@ -401,7 +529,7 @@ class JDBCBackend(CachingBackend):
         jname = {
             'meta': 'meta',
             'region': 'nodeName',
-            'time': 'time',
+            'subannual': 'subannual',
             'unit': 'unitName',
             'variable': 'keyString',
             'year': 'yearlyData'
@@ -428,27 +556,29 @@ class JDBCBackend(CachingBackend):
                 # Construct a row with a single value
                 yield tuple(cm[f] for f in FIELDS['ts_get_geo'])
 
-    def set_data(self, ts, region, variable, data, unit, meta):
+    def set_data(self, ts, region, variable, data, unit, subannual, meta):
         # Convert *data* to a Java data structure
         jdata = java.LinkedHashMap()
         for k, v in data.items():
             # Explicit cast is necessary; otherwise java.lang.Long
             jdata.put(java.Integer(k), v)
 
-        self.jindex[ts].addTimeseries(region, variable, None, jdata, unit,
+        self.jindex[ts].addTimeseries(region, variable, subannual, jdata, unit,
                                       meta)
 
-    def set_geo(self, ts, region, variable, time, year, value, unit, meta):
-        self.jindex[ts].addGeoData(region, variable, time, java.Integer(year),
-                                   value, unit, meta)
+    def set_geo(self, ts, region, variable, subannual, year, value, unit,
+                meta):
+        self.jindex[ts].addGeoData(region, variable, subannual,
+                                   java.Integer(year), value, unit, meta)
 
-    def delete(self, ts, region, variable, years, unit):
-        years = to_jlist2(years, java.Integer)
-        self.jindex[ts].removeTimeseries(region, variable, None, years, unit)
+    def delete(self, ts, region, variable, subannual, years, unit):
+        years = to_jlist(years, java.Integer)
+        self.jindex[ts].removeTimeseries(region, variable, subannual, years,
+                                         unit)
 
-    def delete_geo(self, ts, region, variable, time, years, unit):
-        years = to_jlist2(years, java.Integer)
-        self.jindex[ts].removeGeoData(region, variable, time, years, unit)
+    def delete_geo(self, ts, region, variable, subannual, years, unit):
+        years = to_jlist(years, java.Integer)
+        self.jindex[ts].removeGeoData(region, variable, subannual, years, unit)
 
     # Scenario methods
 
@@ -463,12 +593,12 @@ class JDBCBackend(CachingBackend):
                 f'Clone between {self.__class__} and'
                 f'{platform_dest._backend.__class__}')
         elif platform_dest._backend is not self:
-            msg = 'Cross-platform clone of {}.Scenario with'.format(
-                s.__class__.__module__.split('.')[0])
+            package = s.__class__.__module__.split('.')[0]
+            msg = f'Cross-platform clone of {package}.Scenario with'
             if keep_solution is False:
-                raise NotImplementedError(msg + ' `keep_solution=False`')
+                raise NotImplementedError(f'{msg} `keep_solution=False`')
             elif 'message_ix' in msg and first_model_year is not None:
-                raise NotImplementedError(msg + ' first_model_year != None')
+                raise NotImplementedError(f'{msg} first_model_year != None')
 
         # Prepare arguments
         args = [platform_dest._backend.jobj, model, scenario, annotation,
@@ -492,9 +622,17 @@ class JDBCBackend(CachingBackend):
     def init_item(self, s, type, name, idx_sets, idx_names):
         # generate index-set and index-name lists
         if isinstance(idx_sets, set) or isinstance(idx_names, set):
-            raise ValueError('index dimension must be string or ordered lists')
-        idx_sets = to_jlist(idx_sets)
-        idx_names = to_jlist(idx_names if idx_names is not None else idx_sets)
+            raise TypeError('index dimension must be string or ordered lists')
+
+        idx_sets = to_jlist(idx_sets) if len(idx_sets) else None
+
+        if idx_names:
+            if len(idx_names) != len(idx_sets):
+                raise ValueError(f'index names {idx_names!r} must have same'
+                                 f'length as index sets {idx_sets!r}')
+            idx_names = to_jlist(idx_names)
+        else:
+            idx_names = idx_sets
 
         # Initialize the Item
         func = getattr(self.jindex[s], f'initialize{type.title()}')
@@ -504,13 +642,10 @@ class JDBCBackend(CachingBackend):
         try:
             func(name, idx_sets, idx_names)
         except jpype.JException as e:
-            e = str(e)
-            if 'This Scenario cannot be edited' in e:
-                raise RuntimeError(e)
-            elif 'already exists' in e:
-                raise ValueError('{!r} already exists'.format(name))
+            if 'already exists' in e.args[0]:
+                raise ValueError(f'{name!r} already exists')
             else:
-                raise
+                _raise_jexception(e)
 
     def delete_item(self, s, type, name):
         getattr(self.jindex[s], f'remove{type.title()}')(name)
@@ -558,7 +693,7 @@ class JDBCBackend(CachingBackend):
 
                 # Filter for only included values and store
                 filtered_elements = filter(lambda e: e in values, elements)
-                jFilter.put(idx_name, to_jlist2(filtered_elements))
+                jFilter.put(idx_name, to_jlist(filtered_elements))
 
             jList = item.getElements(jFilter)
         else:
@@ -607,7 +742,8 @@ class JDBCBackend(CachingBackend):
             result = result.astype(dtypes)
         elif type == 'set':
             # Index sets
-            result = pd.Series(item.getCol(0, jList))
+            # dtype=object is to silence a warning in pandas 1.0
+            result = pd.Series(item.getCol(0, jList), dtype=object)
         elif type == 'par':
             # Scalar parameters
             result = dict(value=item.getScalarValue().floatValue(),
@@ -628,7 +764,7 @@ class JDBCBackend(CachingBackend):
         try:
             for key, value, unit, comment in elements:
                 # Prepare arguments
-                args = [to_jlist2(key)] if key else []
+                args = [to_jlist(key)] if key else []
                 if type == 'par':
                     args.extend([java.Double(value), unit])
                 if comment:
@@ -645,16 +781,16 @@ class JDBCBackend(CachingBackend):
             msg = e.message()
             if ('does not have an element' in msg) or ('The unit' in msg):
                 # Re-raise as Python ValueError
-                raise ValueError(msg) from e
+                raise ValueError(msg) from None
             else:  # pragma: no cover
-                raise RuntimeError('unhandled Java exception') from e
+                _raise_jexception(e)
 
         self.cache_invalidate(s, type, name)
 
     def item_delete_elements(self, s, type, name, keys):
         jitem = self._get_item(s, type, name, load=False)
         for key in keys:
-            jitem.removeElement(to_jlist2(key))
+            jitem.removeElement(to_jlist(key))
 
         self.cache_invalidate(s, type, name)
 
@@ -672,7 +808,7 @@ class JDBCBackend(CachingBackend):
             _type = {int: 'Num', float: 'Num', str: 'Str', bool: 'Bool'}[_type]
             method_name = 'setMeta' + _type
         except KeyError:
-            raise TypeError('Cannot store metadata of type {}'.format(_type))
+            raise TypeError(f'Cannot store metadata of type {_type}')
 
         getattr(self.jindex[s], method_name)(name, value)
 
@@ -698,35 +834,9 @@ class JDBCBackend(CachingBackend):
         return to_pylist(self.jindex[ms].getCatEle(name, cat))
 
     def cat_set_elements(self, ms, name, cat, keys, is_unique):
-        self.jindex[ms].addCatEle(name, cat, to_jlist2(keys), is_unique)
+        self.jindex[ms].addCatEle(name, cat, to_jlist(keys), is_unique)
 
     # Helpers; not part of the Backend interface
-
-    def write_gdx(self, s, path):
-        """Write the Scenario to a GDX file at *path*."""
-        # include_var_equ=False -> do not include variables/equations in GDX
-        self.jindex[s].toGDX(str(path.parent), path.name, False)
-
-    def read_gdx(self, s, path, check_solution, comment, equ_list, var_list):
-        """Read the Scenario from a GDX file at *path*.
-
-        Parameters
-        ----------
-        check_solution : bool
-            If True, raise an exception if the GAMS solver did not reach
-            optimality. (Only for MESSAGE-scheme Scenarios.)
-        comment : str
-            Comment added to Scenario when importing the solution.
-        equ_list : list of str
-            Equations to be imported.
-        var_list : list of str
-            Variables to be imported.
-        """
-        self.jindex[s].readSolutionFromGDX(
-            str(path.parent), path.name, comment, to_jlist2(var_list),
-            to_jlist2(equ_list), check_solution)
-
-        self.cache_invalidate(s)
 
     def _get_item(self, s, ix_type, name, load=True):
         """Return the Java object for item *name* of *ix_type*.
@@ -744,15 +854,17 @@ class JDBCBackend(CachingBackend):
         try:
             return getattr(self.jindex[s], f'get{ix_type.title()}')(*args)
         except java.IxException as e:
-            if re.match('No item [^ ]* exists in this Scenario', e.args[0]):
+            # Regex for similar but not consistent messages from Java code
+            msg = (f"No (item|{ix_type.title()}) '?{name}'? exists in this "
+                   "Scenario!")
+            if re.match(msg, e.args[0]):
                 # Re-raise as a Python KeyError
-                raise KeyError(f'No {ix_type.title()} {name!r} exists in this '
-                               'Scenario!') from None
+                raise KeyError(name) from None
             else:  # pragma: no cover
-                raise RuntimeError('unhandled Java exception') from e
+                _raise_jexception(e)
 
 
-def start_jvm(jvmargs=[]):
+def start_jvm(jvmargs=None):
     """Start the Java Virtual Machine via :mod:`JPype`.
 
     Parameters
@@ -768,6 +880,8 @@ def start_jvm(jvmargs=[]):
         .. _`JVM documentation`: https://docs.oracle.com/javase/7/docs
            /technotes/tools/windows/java.html)
     """
+    if jvmargs is None:
+        jvmargs = []
     if jpype.isJVMStarted():
         return
 
@@ -788,9 +902,9 @@ def start_jvm(jvmargs=[]):
         convertStrings=True,
     )
 
-    log.debug('JAVA_HOME: {}'.format(os.environ.get('JAVA_HOME', '(not set)')))
-    log.debug('jpype.getDefaultJVMPath: {}'.format(jpype.getDefaultJVMPath()))
-    log.debug('args to startJVM: {} {}'.format(args, kwargs))
+    log.debug(f"JAVA_HOME: {os.environ.get('JAVA_HOME', '(not set)')}")
+    log.debug(f'jpype.getDefaultJVMPath: {jpype.getDefaultJVMPath()}')
+    log.debug(f'args to startJVM: {args} {kwargs}')
 
     jpype.startJVM(*args, **kwargs)
 
@@ -803,36 +917,28 @@ def start_jvm(jvmargs=[]):
 # Conversion methods
 
 def to_pylist(jlist):
-    """Transforms a Java.Array or Java.List to a :class:`numpy.array`."""
-    # handling string array
+    """Convert Java list types to :class:`list`."""
     try:
-        return np.array(jlist[:])
-    # handling Java LinkedLists
+        return list(jlist[:])
     except Exception:
-        return np.array(jlist.toArray()[:])
+        # java.LinkedList
+        return list(jlist.toArray()[:])
 
 
-def to_jlist(pylist, idx_names=None):
-    """Convert *pylist* to a jLinkedList."""
-    if pylist is None:
-        return None
+def to_jlist(arg, convert=None):
+    """Convert :class:`list` *arg* to java.LinkedList.
 
-    jList = java.LinkedList()
-    if idx_names is None:
-        if islistable(pylist):
-            for key in pylist:
-                jList.add(str(key))
-        else:
-            jList.add(str(pylist))
-    else:
-        # pylist must be a dict
-        for idx in idx_names:
-            jList.add(str(pylist[idx]))
-    return jList
+    Parameters
+    ----------
+    arg : Collection or Iterable
+    convert : callable, optional
+        If supplied, every element of *arg* is passed through `convert` before
+        being added.
 
-
-def to_jlist2(arg, convert=None):
-    """Simple conversion of :class:`list` *arg* to java.LinkedList."""
+    Returns
+    -------
+    java.LinkedList
+    """
     jlist = java.LinkedList()
 
     if convert:
@@ -848,9 +954,3 @@ def to_jlist2(arg, convert=None):
         raise ValueError(arg)
 
     return jlist
-
-
-@lru_cache(1)
-def timespans():
-    # Mapping for the enums of at.ac.iiasa.ixmp.objects.TimeSeries.TimeSpan
-    return {t.getDbValue(): t.name() for t in java.TimeSpan.values()}
