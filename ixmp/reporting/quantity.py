@@ -1,10 +1,9 @@
-from collections import OrderedDict
 from collections.abc import Collection
-from copy import deepcopy
 
 import numpy
 import pandas as pd
-from pandas.core.generic import NDFrame
+import pandas.core.indexes.base as ibase
+import pint
 import xarray as xr
 
 
@@ -16,34 +15,52 @@ class AttrSeries(pd.Series):
     matrix support, ixmp quantities may be too large for available memory.
 
     The AttrSeries class provides similar methods and behaviour to
-    :class:`xarray.DataArray`, such as an `attrs` dictionary for metadata, so
-    that :mod:`ixmp.reporting.computations` methods can use xarray-like syntax.
+    :class:`xarray.DataArray`, so that :mod:`ixmp.reporting.computations`
+    methods can use xarray-like syntax.
+
+    Parameters
+    ----------
+    units : str or pint.Unit, optional
+        Set the units attribute. The value is converted to :class:`pint.Unit`
+        and added to `attrs`.
+    attrs : :class:`~collections.abc.Mapping`, optional
+        Set the :attr:`~pandas.Series.attrs` of the AttrSeries. This attribute
+        was added in `pandas 1.0
+        <https://pandas.pydata.org/docs/whatsnew/v1.0.0.html>`_, but is not
+        currently supported by the Series constructor.
     """
 
-    # normal properties
-    _metadata = ('attrs', )
+    # See https://pandas.pydata.org/docs/development/extending.html
+    @property
+    def _constructor(self):
+        return AttrSeries
 
-    def __init__(self, *args, **kwargs):
-        if 'attrs' in kwargs:
-            # Use provided attrs
-            attrs = kwargs.pop('attrs')
-        elif hasattr(args[0], 'attrs'):
-            # Use attrs from an xarray object
-            attrs = args[0].attrs.copy()
+    def __init__(self, data=None, *args, name=None, units=None, attrs=None,
+                 **kwargs):
+        attrs = attrs or dict()
+        if units:
+            # Insert the units into the attrs
+            attrs['_unit'] = pint.Unit(units)
 
-            # pre-convert to a pd.Series to preserve names and labels
-            args = list(args)
-            try:
-                args[0] = args[0].to_series()
-            except AttributeError:
-                pass  # args[0] was already pd.Series
-        else:
-            # default empty
-            attrs = OrderedDict()
+        if isinstance(data, (AttrSeries, xr.DataArray)):
+            # Use attrs from an existing object
+            new_attrs = data.attrs.copy()
 
-        super().__init__(*args, **kwargs)
+            # Overwrite with explicit attrs argument
+            new_attrs.update(attrs)
+            attrs = new_attrs
 
-        self.attrs = attrs
+            # Pre-convert to pd.Series from xr.DataArray to preserve names and
+            # labels. For AttrSeries, this is a no-op (see below).
+            name = ibase.maybe_extract_name(name, data, type(self))
+            data = data.to_series()
+
+        # Don't pass attrs to pd.Series constructor; it currently does not
+        # accept them
+        super().__init__(data, *args, name=name, **kwargs)
+
+        # Update the attrs after initialization
+        self.attrs.update(attrs)
 
     @classmethod
     def from_series(cls, series, sparse=None):
@@ -124,42 +141,23 @@ class AttrSeries(pd.Series):
     def to_series(self):
         return self
 
-    @property
-    def _constructor(self):
-        return AttrSeries
 
-    def __finalize__(self, other, method=None, **kwargs):
-        """Propagate metadata from other to self.
-
-        This is identical to the version in pandas, except deepcopy() is added
-        so that the 'attrs' OrderedDict is not double-referenced.
-        """
-        if isinstance(other, NDFrame):
-            for name in self._metadata:
-                object.__setattr__(self, name,
-                                   deepcopy(getattr(other, name, None)))
-        return self
-
-
+#: The current internal class used to represent reporting quantities.
+#: :meth:`as_quantity` always converts to this type.
+Quantity = AttrSeries
 # See also:
 # - test_report_size() for a test that shows how non-sparse xr.DataArray
 #   triggers MemoryError.
-Quantity = AttrSeries
 # Quantity = xr.DataArray
 
 
-def as_attrseries(obj):
-    """Convert obj to an AttrSeries."""
-    return AttrSeries(obj)
-
-
-def as_sparse_xarray(obj):  # pragma: no cover
+def as_sparse_xarray(obj, units=None):  # pragma: no cover
     """Convert *obj* to :class:`xarray.DataArray` with sparse.COO storage."""
     import sparse
     from xarray.core.dtypes import maybe_promote
 
     if isinstance(obj, xr.DataArray) and isinstance(obj.data, numpy.ndarray):
-        return xr.DataArray(
+        result = xr.DataArray(
             data=sparse.COO.from_numpy(
                 obj.data,
                 fill_value=maybe_promote(obj.data.dtype)[1]),
@@ -169,11 +167,20 @@ def as_sparse_xarray(obj):  # pragma: no cover
             attrs=obj.attrs,
         )
     elif isinstance(obj, pd.Series):
-        return xr.DataArray.from_series(obj, sparse=True)
-
+        result = xr.DataArray.from_series(obj, sparse=True)
     else:
-        print(type(obj), type(obj.data))
-        return obj
+        result = obj
+
+    if units:
+        result.attrs['_unit'] = pint.Unit(units)
+
+    return result
 
 
-as_quantity = as_attrseries if Quantity is AttrSeries else as_sparse_xarray
+#: Convert args to :class:`.Quantity` class.
+#:
+#: Returns
+#: -------
+#: .Quantity
+#:     `obj` converted to the current Quantity type.
+as_quantity = AttrSeries if Quantity is AttrSeries else as_sparse_xarray

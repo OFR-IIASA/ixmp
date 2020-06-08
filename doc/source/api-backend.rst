@@ -13,7 +13,12 @@ Provided backends
 -----------------
 
 .. automodule:: ixmp.backend
-   :members: BACKENDS, ItemType
+   :members: BACKENDS
+
+   .. autoclass:: ItemType
+      :members:
+      :undoc-members:
+      :member-order: bysource
 
 .. currentmodule:: ixmp.backend.jdbc
 
@@ -90,12 +95,14 @@ Backend API
 
       close_db
       get_auth
+      get_doc
       get_log_level
       get_nodes
       get_scenarios
       get_units
       open_db
       read_file
+      set_doc
       set_log_level
       set_node
       set_unit
@@ -117,7 +124,7 @@ Backend API
       get
       get_data
       get_geo
-      init_ts
+      init
       is_default
       last_update
       preload
@@ -137,7 +144,6 @@ Backend API
       delete_item
       get_meta
       has_solution
-      init_s
       init_item
       item_delete_elements
       item_get_elements

@@ -3,6 +3,7 @@ from itertools import repeat, zip_longest
 import logging
 from pathlib import Path
 from warnings import warn
+from weakref import ProxyType, proxy
 
 import numpy as np
 import pandas as pd
@@ -51,10 +52,15 @@ class Platform:
         :class:`.JDBCBackend`.
     """
 
+    # Storage back end for the platform
+    _backend = None
+
     # List of method names which are handled directly by the backend
     _backend_direct = [
         'open_db',
         'close_db',
+        'get_doc',
+        'set_doc',
     ]
 
     def __init__(self, name=None, backend=None, **backend_args):
@@ -82,8 +88,10 @@ class Platform:
             backend_class = kwargs.pop('class')
             backend_class = BACKENDS[backend_class]
         except KeyError:
-            raise ValueError('backend class {!r} not among {}'
-                             .format(backend_class, sorted(BACKENDS.keys())))
+            raise ValueError(
+                f'backend class {repr(backend_class)} not among '
+                + str(sorted(BACKENDS.keys()))
+            )
 
         # Instantiate the backend
         self._backend = backend_class(**kwargs)
@@ -103,12 +111,21 @@ class Platform:
         level : str
             Name of a :py:ref:`Python logging level <levels>`.
         """
-        if level not in dir(logging):
-            msg = '{} not a valid Python logger level, see ' + \
+        if not (level in dir(logging) or isinstance(level, int)):
+            raise ValueError(
+                f'{repr(level)} is not a valid Python logger level, see '
                 'https://docs.python.org/3/library/logging.html#logging-level'
-            raise ValueError(msg.format(level))
-        log.setLevel(level)
-        logger().setLevel(level)
+            )
+
+        # Set the level for the 'ixmp' logger
+        # NB this may produce unexpected results when multiple Platforms exist
+        #    and different log levels are set. To fix, could use a sub-logger
+        #    per Platform instance.
+        logging.getLogger('ixmp').setLevel(level)
+
+        # Set the level for the 'ixmp.backend.*' logger. For JDBCBackend, this
+        # also has the effect of setting the level for Java log messages that
+        # are printed to stdout.
         self._backend.set_log_level(level)
 
     def get_log_level(self):
@@ -179,7 +196,7 @@ class Platform:
             - unit
             - region
             - meta
-            - time
+            - subannual
             - year
             - value
         default : bool, optional
@@ -252,9 +269,13 @@ class Platform:
                 continue
 
             log.warning(
-                f'region {name!r} is already defined on the Platform'
-                + (f' as a synonym for {r.mapped_to!r}' if r.mapped_to else '')
-                + (f' under parent {r.parent!r}' if r.parent else ''))
+                f'region {repr(name)} is already defined on the Platform'
+                + (
+                    f' as a synonym for {repr(r.mapped_to)}' if r.mapped_to
+                    else ''
+                )
+                + (f' under parent {repr(r.parent)}' if r.parent else '')
+            )
             return True
 
         return False
@@ -373,9 +394,6 @@ class Platform:
             return {model: result.get(model) == 1 for model in models_list}
 
 
-# %% class TimeSeries
-
-
 class TimeSeries:
     """Collection of data in time series format.
 
@@ -406,25 +424,60 @@ class TimeSeries:
     #: Version of the TimeSeries. Immutable for a specific instance.
     version = None
 
-    def __init__(self, mp, model, scenario, version=None, annotation=None):
+    def __init__(self, mp, model, scenario, version=None, annotation=None,
+                 **kwargs):
+        # Check arguments
         if not isinstance(mp, Platform):
             raise TypeError('mp is not a valid `ixmp.Platform` instance')
+        elif version and not (version == 'new' or isinstance(version, int)):
+            raise ValueError(f'version={repr(version)}')
+        elif version == 'new' and annotation is None:
+            log.warning(
+                f'Missing annotation for new {self.__class__.__name__}'
+                f' {model}/{scenario}'
+            )
+            annotation = ''
+
+        # scheme= keyword argument only passed from Scenario.__init__;
+        # otherwise must be None
+        scheme = kwargs.get('scheme', None)
+        if scheme:
+            if self.__class__ is TimeSeries:
+                raise TypeError("'scheme' argument to TimeSeries()")
+            else:
+                self.scheme = scheme
 
         # Set attributes
-        self.platform = mp
         self.model = model
         self.scenario = scenario
 
+        # Store a weak reference to the Platform object. This reference is not
+        # enough to keep the Platform alive, i.e. 'del mp' will work even while
+        # this TimeSeries object lives.
+        self.platform = mp if isinstance(mp, ProxyType) else proxy(mp)
+
         if version == 'new':
-            self._backend('init_ts', annotation)
-        elif isinstance(version, int) or version is None:
-            self._backend('get', version)
+            # Initialize a new object
+            self._backend('init', annotation)
         else:
-            raise ValueError(f'version={version!r}')
+            # Retrieve an existing object
+            self.version = version
+            self._backend('get')
 
     def _backend(self, method, *args, **kwargs):
-        """Convenience for calling *method* on the backend."""
+        """Convenience for calling *method* on the backend.
+
+        The weak reference to the Platform object is used, if the Platform is
+        still alive.
+        """
         return self.platform._backend(self, method, *args, **kwargs)
+
+    def __del__(self):
+        # Instruct the back end to free memory associated with the TimeSeries
+        try:
+            self._backend('del_ts')
+        except ReferenceError:
+            pass  # The Platform has already been garbage-collected
 
     # Transactions and versioning
     # functions for platform management
@@ -433,7 +486,15 @@ class TimeSeries:
         return False
 
     def check_out(self, timeseries_only=False):
-        """Check out the TimeSeries for modification."""
+        """Check out the TimeSeries.
+
+        Data in the TimeSeries can only be modified when it is in a checked-out
+        state.
+
+        See Also
+        --------
+        utils.maybe_check_out
+        """
         self._backend('check_out', timeseries_only)
 
     def commit(self, comment):
@@ -447,6 +508,10 @@ class TimeSeries:
         ----------
         comment : str
             Description of the changes being committed.
+
+        See Also
+        --------
+        utils.maybe_commit
         """
         self._backend('commit', comment)
 
@@ -551,26 +616,36 @@ class TimeSeries:
                           meta)
 
     def timeseries(self, region=None, variable=None, unit=None, year=None,
-                   iamc=False):
-        """Retrieve TimeSeries data.
+                   iamc=False, subannual='auto'):
+        """Retrieve timeseries data.
 
         Parameters
         ----------
-        iamc : bool, default: False
+        iamc : bool, optional
             Return data in wide/'IAMC' format. If :obj:`False`, return data in
             long/'tabular' format; see :meth:`add_timeseries`.
-        region : str or list of strings
+        region : str or list of str, optional
             Regions to include in returned data.
-        variable : str or list of strings
+        variable : str or list of str, optional
             Variables to include in returned data.
-        unit : str or list of strings
+        unit : str or list of str, optional
             Units to include in returned data.
-        year : str, int or list of strings or integers
+        year : str or int or list of (str or int), optional
             Years to include in returned data.
+        subannual : bool or 'auto', optional
+            Whether to include column for sub-annual specification (if
+            :class:`bool`); if 'auto', include column if sub-annual data (other
+            than 'Year') exists in returned dataframe.
+
+        Raises
+        ------
+        ValueError
+            If `subannual` is :obj:`False` but Scenario has (filtered)
+            sub-annual data.
 
         Returns
         -------
-        :class:`pandas.DataFrame`
+        pandas.DataFrame
             Specified data.
         """
         # Retrieve data, convert to pandas.DataFrame
@@ -583,9 +658,21 @@ class TimeSeries:
         df['model'] = self.model
         df['scenario'] = self.scenario
 
+        # drop `subannual` column if not requested (False) or required ('auto')
+        if subannual is not True:
+            has_subannual = not all(df['subannual'] == 'Year')
+            if subannual is False and has_subannual:
+                msg = ("timeseries data has subannual values, ",
+                       "use `subannual=True or 'auto'`")
+                raise ValueError(msg)
+            if not has_subannual:
+                df.drop('subannual', axis=1, inplace=True)
+
         if iamc:
             # Convert to wide format
-            index = IAMC_IDX + ['subannual']
+            index = IAMC_IDX
+            if 'subannual' in df.columns:
+                index = index + ['subannual']
             df = df.pivot_table(index=index, columns='year')['value'] \
                    .reset_index()
             df.columns.names = [None]
@@ -697,8 +784,6 @@ class TimeSeries:
         )
 
 
-# %% class Scenario
-
 class Scenario(TimeSeries):
     """Collection of model-related data.
 
@@ -708,45 +793,46 @@ class Scenario(TimeSeries):
     Parameters
     ----------
     scheme : str, optional
-        Use an explicit scheme for initializing a new scenario.
-    cache : bool, optional
-        Store data in memory and return cached values instead of repeatedly
-        querying the backend.
+        Use an explicit scheme to initialize the new scenario. The
+        :meth:`~.base.Model.initialize` method of the corresponding
+        :class:`.Model` subclass in :data:`.MODELS` is used to initialize items
+        in the Scenario.
     """
     #: Scheme of the Scenario.
     scheme = None
 
     def __init__(self, mp, model, scenario, version=None, scheme=None,
-                 annotation=None, cache=False, **model_init_args):
-        if not isinstance(mp, Platform):
-            raise TypeError('mp is not a valid `ixmp.Platform` instance')
+                 annotation=None, **model_init_args):
+        # Check arguments
+        if version == 'new' and scheme is None:
+            log.info(f'No scheme for new Scenario {model}/{scenario}')
+            scheme = ''
 
-        # Set attributes
-        self.platform = mp
-        self.scheme = scheme
-        self.model = model
-        self.scenario = scenario
+        if 'cache' in model_init_args:
+            warn(f'Scenario(..., cache=...) is deprecated; use Platform(..., '
+                 'cache=...) instead', DeprecationWarning)
+            model_init_args.pop('cache')
 
-        if version == 'new':
-            self._backend('init_s', scheme, annotation)
-        elif isinstance(version, int) or version is None:
-            self._backend('get', version)
-        else:
-            raise ValueError(f'version={version!r}')
+        # Call the parent constructor
+        super().__init__(
+            mp=mp,
+            model=model,
+            scenario=scenario,
+            version=version,
+            scheme=scheme,
+            annotation=annotation,
+        )
 
         if self.scheme == 'MESSAGE' and self.__class__ is Scenario:
+            # Loaded scenario has an improper scheme
             raise RuntimeError(f'{model}/{scenario} is a MESSAGE-scheme '
                                'scenario; use message_ix.Scenario().')
 
         # Retrieve the Model class correlating to the *scheme*
-        model_class = get_model(scheme).__class__
+        model_class = get_model(self.scheme).__class__
 
         # Use the model class to initialize the Scenario
         model_class.initialize(self, **model_init_args)
-
-    @property
-    def _cache(self):
-        return hasattr(self.platform._backend, '_cache')
 
     @classmethod
     def from_url(cls, url, errors='warn'):
@@ -786,8 +872,10 @@ class Scenario(TimeSeries):
             scenario = cls(platform, **scenario_info)
         except Exception as e:
             if errors == 'warn':
-                log.warning('{}: {}\nwhen loading Scenario from url: {!r}'
-                            .format(e.__class__.__name__, e.args[0], url))
+                log.warning(
+                    f'{e.__class__.__name__}: {e.args[0]}\n'
+                    f'when loading Scenario from url: {repr(url)}'
+                )
                 return None, platform
             else:
                 raise
@@ -795,7 +883,18 @@ class Scenario(TimeSeries):
             return scenario, platform
 
     def check_out(self, timeseries_only=False):
-        """Check out the Scenario for modification."""
+        """Check out the Scenario.
+
+        Raises
+        ------
+        ValueError
+            If :meth:`has_solution` is :obj:`True`.
+
+        See Also
+        --------
+        TimeSeries.check_out
+        utils.maybe_check_out
+        """
         if not timeseries_only and self.has_solution():
             raise ValueError('This Scenario has a solution, '
                              'use `Scenario.remove_solution()` or '
@@ -811,7 +910,7 @@ class Scenario(TimeSeries):
         ValueError
             If the Scenario was instantiated with ``cache=False``.
         """
-        if not self._cache:
+        if not getattr(self.platform._backend, 'cache_enabled', False):
             raise ValueError('Cache must be enabled to load scenario data')
 
         for ix_type in 'equ', 'par', 'set', 'var':
@@ -939,8 +1038,9 @@ class Scenario(TimeSeries):
         if len(idx_names) == 0:
             # Basic set. Keys must be strings.
             if isinstance(key, (dict, pd.DataFrame)):
-                raise ValueError('dict, DataFrame keys invalid for '
-                                 f'basic set {name!r}')
+                raise ValueError(
+                    'dict, DataFrame keys invalid for basic set {repr(name)}'
+                )
 
             # Ensure keys is a list of str
             keys = as_str_list(key)
@@ -998,12 +1098,14 @@ class Scenario(TimeSeries):
         for e, c in to_add:
             # Check for sentinel values
             if e is False:
-                raise ValueError(f'Comment {c!r} without matching key')
+                raise ValueError(f'Comment {repr(c)} without matching key')
             elif c is False:
-                raise ValueError(f'Key {e!r} without matching comment')
+                raise ValueError(f'Key {repr(e)} without matching comment')
             elif len(idx_names) and len(idx_names) != len(e):
-                raise ValueError(f'{len(e)}-D key {e!r} invalid for '
-                                 f'{len(idx_names)}-D set {name}{idx_names!r}')
+                raise ValueError(
+                    f'{len(e)}-D key {repr(e)} invalid for '
+                    f'{len(idx_names)}-D set {name}{repr(idx_names)}'
+                )
 
         # Send to backend
         elements = ((kc[0], None, None, kc[1]) for kc in to_add)
@@ -1437,7 +1539,7 @@ class Scenario(TimeSeries):
 
         # Validate *callback* argument
         if callback is not None and not callable(callback):
-            raise ValueError('callback={!r} is not callable'.format(callback))
+            raise ValueError(f'callback={repr(callback)} is not callable')
         elif callback is None:
             # Make the callback a no-op
             def callback(scenario, **kwargs):
@@ -1470,44 +1572,68 @@ class Scenario(TimeSeries):
                 break
 
     def get_meta(self, name=None):
-        """Get scenario metadata.
+        """Get scenario meta.
 
         Parameters
         ----------
         name : str, optional
-            metadata attribute name
+            meta attribute name
         """
         all_meta = self._backend('get_meta')
         return all_meta[name] if name else all_meta
 
-    def set_meta(self, name, value):
-        """Set scenario metadata.
+    def set_meta(self, name_or_dict, value=None):
+        """Set scenario meta.
 
         Parameters
         ----------
-        name : str
-            metadata attribute name
-        value : str or number or bool
-            metadata attribute value
+        name_or_dict : str or dict
+            If the argument is dict, it used as a mapping of meta
+            categories (names) to values. Otherwise, use the argument
+            as the meta attribute name.
+        value : str or number or bool, optional
+            Meta attribute value.
         """
-        self._backend('set_meta', name, value)
+        if type(name_or_dict) == dict:
+            name_or_dict = list(name_or_dict.items())
+        self._backend('set_meta', name_or_dict, value)
+
+    def delete_meta(self, name):
+        """Delete scenario meta.
+
+        Parameters
+        ----------
+        name : str or list of str
+            Either single meta key or list of keys.
+        """
+        self._backend('delete_meta', name)
 
     # Input and output
-    def to_excel(self, path):
+    def to_excel(self, path, items=ItemType.SET | ItemType.PAR, max_row=None):
         """Write Scenario to a Microsoft Excel file.
 
         Parameters
         ----------
         path : os.PathLike
-            File to write. Must have suffix '.xlsx'.
+            File to write. Must have suffix :file:`.xlsx`.
+        items : ItemType, optional
+            Types of items to write. Either :attr:`.SET` | :attr:`.PAR` (i.e.
+            only sets and parameters), or :attr:`.MODEL` (also variables and
+            equations, i.e. model solution data).
+        max_row: int, optional
+            Maximum number of rows in each sheet. If the number of elements in
+            an item exceeds this number or :data:`.EXCEL_MAX_ROWS`, then an
+            item is written to multiple sheets named, e.g. 'foo', 'foo(2)',
+            'foo(3)', etc.
 
         See also
         --------
         :ref:`excel-data-format`
         read_excel
         """
-        self.platform._backend.write_file(Path(path), ItemType.MODEL,
-                                          filters=dict(scenario=self))
+        self.platform._backend.write_file(Path(path), items,
+                                          filters=dict(scenario=self),
+                                          max_row=max_row)
 
     def read_excel(self, path, add_units=False, init_items=False,
                    commit_steps=False):
@@ -1576,7 +1702,7 @@ def to_iamc_layout(df):
     required_cols = ['region', 'variable', 'unit']
     missing = list(set(required_cols) - set(df.columns))
     if len(missing):
-        raise ValueError(f'missing required columns {missing!r}')
+        raise ValueError(f'missing required columns {repr(missing)}')
 
     # Add a column 'subannual' with the default value
     if 'subannual' not in df.columns:

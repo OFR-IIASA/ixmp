@@ -4,6 +4,7 @@ import pytest
 
 from ixmp.backend import ItemType
 from ixmp.backend.base import Backend, CachingBackend
+from ixmp.testing import make_dantzig
 
 
 def test_class():
@@ -30,9 +31,11 @@ def test_class():
         delete = noop
         delete_geo = noop
         delete_item = noop
+        delete_meta = noop
         discard_changes = noop
         get = noop
         get_data = noop
+        get_doc = noop
         get_geo = noop
         get_meta = noop
         get_nodes = noop
@@ -40,9 +43,8 @@ def test_class():
         get_timeslices = noop
         get_units = noop
         has_solution = noop
+        init = noop
         init_item = noop
-        init_s = noop
-        init_ts = noop
         is_default = noop
         item_delete_elements = noop
         item_get_elements = noop
@@ -55,6 +57,7 @@ def test_class():
         set_data = noop
         set_geo = noop
         set_meta = noop
+        set_doc = noop
         set_node = noop
         set_timeslice = noop
         set_unit = noop
@@ -78,3 +81,23 @@ def test_cache_non_hashable():
     with pytest.raises(TypeError, match="Object of type .?object.? is not JSON"
                                         " serializable"):
         CachingBackend._cache_key(object(), 'par', 'p', filters)
+
+
+def test_cache_del_ts(test_mp):
+    """Test CachingBackend.del_ts()."""
+    # Since CachingBackend is an abstract class, test it via JDBCBackend
+    backend = test_mp._backend
+    cache_size_pre = len(backend._cache)
+
+    # Load data, thereby adding to the cache
+    s = make_dantzig(test_mp)
+    s.par('d')
+
+    # Cache size has increased
+    assert len(backend._cache) == cache_size_pre + 1
+
+    # Delete the object; associated cache is freed
+    del s
+
+    # Objects were invalidated/removed from cache
+    assert len(backend._cache) == cache_size_pre

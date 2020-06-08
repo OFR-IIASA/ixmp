@@ -1,10 +1,16 @@
 from collections.abc import Iterable
+from functools import partial
+from inspect import Parameter, signature
 import logging
+from pathlib import Path
 import re
+import sys
 from urllib.parse import urlparse
 
 import pandas as pd
 
+
+log = logging.getLogger(__name__)
 
 # globally accessible logger
 _LOGGER = None
@@ -54,6 +60,73 @@ def check_year(y, s):
     if y is not None:
         if not isinstance(y, int):
             raise ValueError('arg `{}` must be an integer!'.format(s))
+        return True
+
+
+def maybe_check_out(timeseries, state=None):
+    """Check out `timeseries` depending on `state`.
+
+    If `state` is :obj:`None`, then :meth:`check_out` is called.
+
+    Returns
+    -------
+    :obj:`True`
+        if `state` was :obj:`None` and a check out was performed, i.e.
+        `timeseries` was previously in a checked-in state.
+    :obj:`False`
+        if `state` was :obj:`None` and no check out was performed, i.e.
+        `timeseries` was already in a checked-out state.
+    `state`
+        if `state` was not :obj:`None` and no check out was attempted.
+
+    Raises
+    ------
+    ValueError
+        If `timeseries` is a :class:`.Scenario` object and
+        :meth:`~.Scenario.has_solution` is :obj:`True`.
+
+    See Also
+    --------
+    :meth:`.TimeSeries.check_out`
+    :meth:`.Scenario.check_out`
+    """
+    if state is not None:
+        return state
+
+    try:
+        timeseries.check_out()
+    except RuntimeError:
+        # If `timeseries` is new (has not been committed), the checkout
+        # attempt raises an exception
+        return False
+    else:
+        return True
+
+
+def maybe_commit(timeseries, condition, message):
+    """Commit `timeseries` with `message` if `condition` is :obj:`True`.
+
+    Returns
+    -------
+    :obj:`True`
+        if a commit is performed.
+    :obj:`False`
+        if any exception is raised during the attempted commit. The exception
+        is logged with level ``INFO``.
+
+    See Also
+    --------
+    :meth:`.TimeSeries.commit`
+    """
+    if not condition:
+        return False
+
+    try:
+        timeseries.commit(message)
+    except RuntimeError as exc:
+        log.info(f"maybe_commit() didn't commit: {exc}")
+        return False
+    else:
         return True
 
 
@@ -116,6 +189,24 @@ def parse_url(url):
         scenario_info['version'] = int(components.fragment)
 
     return platform_info, scenario_info
+
+
+def partial_split(func, kwargs):
+    """Forgiving version of :func:`functools.partial`.
+
+    Returns a partial object and leftover kwargs not applicable to `func`.
+    """
+    # Names of parameters to
+    par_names = signature(func).parameters
+    func_args, extra = {}, {}
+    for name, value in kwargs.items():
+        if name in par_names and \
+                par_names[name].kind == Parameter.POSITIONAL_OR_KEYWORD:
+            func_args[name] = value
+        else:
+            extra[name] = value
+
+    return partial(func, **func_args), extra
 
 
 def year_list(x):
@@ -238,6 +329,69 @@ def format_scenario_list(platform, model=None, scenario=None, match=None,
         ])
 
     return lines
+
+
+def show_versions(file=sys.stdout):
+    """Print information about ixmp and its dependencies to *file*."""
+    import importlib
+    from subprocess import DEVNULL, check_output
+
+    from xarray.util.print_versions import get_sys_info
+
+    def _git_log(mod):
+        cmd = ['git', 'log', '--oneline', '--no-color', '--decorate', '-n 1']
+        cwd = Path(mod.__file__).parent
+        try:
+            info = check_output(cmd, cwd=cwd, encoding='utf-8', stderr=DEVNULL)
+        except Exception:
+            return ''
+        else:
+            return f'\n     {info.rstrip()}'
+
+    deps = [
+        None,  # Prints a separator
+
+        # ixmp stack
+        'ixmp', 'message_ix', 'message_data', None,
+
+        # ixmp dependencies
+        'click', 'dask', 'graphviz', 'jpype', 'pandas', 'pint', 'xarray',
+        'xlrd', 'xlsxwriter', 'yaml', None,
+
+        # Optional dependencies, dependencies of message_ix and message_data
+        'iam_units', 'jupyter', 'matplotlib', 'plotnine', 'pyam', None,
+    ]
+
+    info = []
+    for module_name in deps:
+        try:
+            # Import the module
+            mod = sys.modules.get(module_name, None) \
+                or importlib.import_module(module_name)
+        except Exception:
+            # Couldn't import
+            info.append((module_name, None))
+            continue
+
+        # Retrieve git log information, if any
+        gl = _git_log(mod)
+        try:
+            version = mod.__version__
+        except Exception:
+            # __version__ not available
+            version = 'installed'
+        finally:
+            info.append((module_name, version + gl))
+
+    # Use xarray to get system & Python information
+    info.extend(get_sys_info()[1:])  # Exclude the commit number
+
+    for k, stat in info:
+        if (k, stat) == (None, None):
+            # Separator line
+            print('', file=file)
+        else:
+            print(f"{k + ':':12} {stat}", file=file)
 
 
 def update_par(scenario, name, data):

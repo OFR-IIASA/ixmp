@@ -17,8 +17,15 @@
 #     DataArrays is non-trivial; see https://stackoverflow.com/q/56396122/
 #   - Internal computations have .attr['_unit'] describing the units of the
 #     quantity, to carry these through calculations.
+#
+# - Always call pint.get_application_registry() from *within* functions
+#   (instead of in global scope); this allows downstream code to change which
+#   registry is used.
+#   - The top-level methods pint.Quantity() and pint.Unit() can also be used;
+#     these use the application registry.
 
 from functools import partial
+from inspect import signature
 from itertools import chain, repeat
 import logging
 from pathlib import Path
@@ -32,10 +39,12 @@ from dask.optimization import cull
 import pint
 import yaml
 
+from ixmp.utils import partial_split
 from . import computations
 from .describe import describe_recursive
 from .exceptions import ComputationError
 from .key import Key
+from .quantity import Quantity, as_quantity
 from .utils import (
     REPLACE_UNITS,
     RENAME_DIMS,
@@ -43,24 +52,31 @@ from .utils import (
 )
 
 
+__all__ = [
+    'Key',
+    'Quantity',
+    'Reporter',
+    'as_quantity',
+    'configure',
+]
+
 log = logging.getLogger(__name__)
 
 
 class KeyExistsError(KeyError):
     def __str__(self):
-        return f'key {self.args[0]!r} already exists'
+        return f'key {repr(self.args[0])} already exists'
 
 
 class MissingKeyError(KeyError):
     def __str__(self):
-        return f'required keys {self.args!r} not defined'
+        return f'required keys {repr(self.args)} not defined'
 
 
 class Reporter:
     """Class for generating reports on :class:`ixmp.Scenario` objects."""
     # TODO meet the requirements:
     # A3iii. Interpolation.
-    # A7. Renaming of outputs.
 
     #: A dask-format :doc:`graph <graphs>`.
     graph = {'config': {}}
@@ -70,6 +86,9 @@ class Reporter:
 
     # An index of ixmp names -> full keys
     _index = {}
+
+    # Module containing pre-defined computations
+    _computations = computations
 
     def __init__(self, **kwargs):
         self.graph = {'config': {}}
@@ -100,6 +119,9 @@ class Reporter:
         # New Reporter
         rep = cls(**kwargs)
 
+        # Add the scenario itself
+        rep.add('scenario', scenario)
+
         # List of top-level keys
         all_keys = []
 
@@ -111,19 +133,20 @@ class Reporter:
         )
 
         for ix_type, name in quantities:
-            # List of computations for the quantity and its partial sums
-            comps = list(keys_for_quantity(ix_type, name, scenario))
+            # List of computations for the quantity and maybe its marginals
+            comps = keys_for_quantity(ix_type, name, scenario)
 
-            # Add to the graph
-            rep.graph.update(comps)
+            # Add to the graph and index, including sums
+            rep.add(*comps[0], strict=True, index=True, sums=True)
 
-            # Add first 1 or 2 (equ marginals) keys to the list of all
-            # quantities
-            full_comps = comps[:(2 if ix_type == 'equ' else 1)]
-            all_keys.extend(c[0] for c in full_comps)
+            try:
+                # Add any marginals, but without sums
+                rep.add(*comps[1], strict=True, index=True)
+            except IndexError:
+                pass  # Not an equ/var with marginals
 
-            # Index the variable name
-            rep._index[name] = full_comps[0][0]
+            # Add keys to the list of all quantities
+            all_keys.extend(c[0] for c in comps)
 
         # Add a key which simply collects all quantities
         rep.add('all', sorted(all_keys))
@@ -132,25 +155,16 @@ class Reporter:
         for name in scenario.set_list():
             elements = scenario.set(name)
             try:
-                elements = elements.tolist()
+                # Convert Series to list; protect list so that dask schedulers
+                # do not try to interpret its contents as further tasks
+                elements = dask.core.quote(elements.tolist())
             except AttributeError:
                 # pd.DataFrame for a multidimensional set; store as-is
                 pass
+
             rep.add(RENAME_DIMS.get(name, name), elements)
 
-        # Add the scenario itself
-        rep.add('scenario', scenario)
-
         return rep
-
-    def read_config(self, path):
-        """Configure the Reporter with information from a YAML file at *path*.
-
-        See :meth:`configure`.
-        """
-        path = Path(path)
-        with open(path, 'r') as f:
-            self.configure(config_dir=path.parent, **yaml.safe_load(f))
 
     def configure(self, path=None, **config):
         """Configure the Reporter.
@@ -162,7 +176,8 @@ class Reporter:
 
         - *default*: the default reporting key; sets :attr:`default_key`.
         - *filters*: a :class:`dict`, passed to :meth:`set_filters`.
-        - *files*: a :class:`dict` mapping keys to file paths.
+        - *files*: a :class:`list` where every element is a :class:`dict`
+          of keyword arguments to :meth:`add_file`.
         - *alias*: a :class:`dict` mapping aliases to original keys.
 
         Warns
@@ -170,13 +185,14 @@ class Reporter:
         UserWarning
             If *config* contains unrecognized keys.
         """
-        sections = {'default', 'files', 'alias', 'filters'}
-        config = _config_args(path, config, sections=sections)
+        # Maybe load from a path
+        config = _config_args(path, config)
+
+        # Pass to global configuration
+        configure(None, **config)
 
         # Store all configuration in the graph itself
         self.graph['config'] = config.copy()
-
-        config_dir = config.pop('config_dir', '.')
 
         # Read sections
 
@@ -187,107 +203,243 @@ class Reporter:
             pass
 
         # Files with exogenous data
-        for key, path in config.get('files', {}).items():
-            path = Path(path)
+        for item in config.get('files', []):
+            path = Path(item['path'])
             if not path.is_absolute():
                 # Resolve relative paths relative to the directory containing
                 # the configuration file
-                path = config_dir / path
-            self.add_file(path, key)
+                path = config.get('config_dir', Path.cwd()) / path
+            item['path'] = path
+
+            self.add_file(**item)
 
         # Aliases
         for alias, original in config.get('alias', {}).items():
             self.add(alias, original)
 
         # Filters
-        self.set_filters(**config.pop('filters', {}))
+        self.set_filters(**config.get('filters', {}))
 
         return self  # to allow chaining
 
-    # Generic graph manipulations
-    def add(self, key, computation, strict=False, index=False, sums=False):
-        """Add *computation* to the Reporter under *key*.
+    def add(self, data, *args, **kwargs):
+        """General-purpose method to add computations.
+
+        :meth:`add` can be called in several ways; its behaviour depends on
+        `data`; see below. It chains to methods such as :meth:`add_single`,
+        :meth:`add_queue`, and :meth:`apply`, which can also be called
+        directly.
 
         Parameters
         ----------
-        key: hashable
+        data, args : various
+
+        Other parameters
+        ----------------
+        sums : bool, optional
+            If :obj:`True`, all partial sums of the key `data` are also added
+            to the Reporter.
+
+        Returns
+        -------
+        list of Key-like
+            Some or all of the keys added to the Reporter.
+
+        Raises
+        ------
+        KeyError
+            If a target key is already in the Reporter; any key referred to by
+            a computation does not exist; or ``sums=True`` and the key for one
+            of the partial sums of `key` is already in the Reporter.
+
+        See also
+        ---------
+        add_single
+        add_queue
+        apply
+        """
+        if isinstance(data, list):
+            # A list. Use add_queue to add
+            return self.add_queue(data, *args, **kwargs)
+
+        elif isinstance(data, str) and data in dir(self._computations):
+            # *data* is the name of a pre-defined computation
+            name = data
+
+            if hasattr(self, f'add_{name}'):
+                # Use a method on the current class to add. This invokes any
+                # argument-handling conveniences, e.g. Reporter.add_product()
+                # instead of using the bare product() computation directly.
+                return getattr(self, f'add_{name}')(*args, **kwargs)
+            else:
+                # Get the function directly
+                func = getattr(self._computations, name)
+                # Rearrange arguments: key, computation function, args, …
+                func, kwargs = partial_split(func, kwargs)
+                return self.add(args[0], func, *args[1:], **kwargs)
+
+        elif isinstance(data, str) and data in dir(self):
+            # Name of another method, e.g. 'apply'
+            return getattr(self, data)(*args, **kwargs)
+
+        elif isinstance(data, (str, Key)):
+            # *data* is a key, *args* are the computation
+            key, computation = data, args
+
+            if kwargs.pop('sums', False):
+                # Convert *key* to a Key object in order to use .iter_sums()
+                key = Key.from_str_or_key(key)
+
+                # Iterable of computations
+                # print((tuple([key] + list(computation)), kwargs))
+                # print([(c, {}) for c in key.iter_sums()])
+                to_add = chain(
+                    # The original
+                    [(tuple([key] + list(computation)), kwargs)],
+                    # One entry for each sum
+                    [(c, {}) for c in key.iter_sums()],
+                )
+
+                return self.add_queue(to_add)
+            else:
+                # Add a single computation (without converting to Key)
+                return self.add_single(key, *computation, **kwargs)
+        else:
+            # Some other kind of import
+            raise ValueError(data)
+
+    def add_queue(self, queue, max_tries=1, fail='raise'):
+        """Add tasks from a list or `queue`.
+
+        Parameters
+        ----------
+        queue : list of 2-tuple
+            The members of each tuple are the arguments (i.e. a list or tuple)
+            and keyword arguments (i.e. a dict) to :meth:`add`.
+        max_tries : int, optional
+            Retry adding elements up to this many times.
+        fail : 'raise' or log level, optional
+            Action to take when a computation from `queue` cannot be added
+            after `max_tries`.
+        """
+        # Elements to retry: list of (tries, args, kwargs)
+        retry = []
+        added = []
+
+        # Iterate over elements from queue, then from retry. On the first pass,
+        # count == 1; on subsequent passes, it is incremented.
+        for count, (args, kwargs) in chain(zip(repeat(1), queue), retry):
+            try:
+                # Recurse
+                added.append(self.add(*args, **kwargs))
+            except KeyError as exc:
+                # Adding failed
+
+                # Information for debugging
+                info = [f'Failed {count} times to add:',
+                        f'    ({repr(args)}, {repr(kwargs)})',
+                        f'    with {repr(exc)}']
+
+                def _log(level):
+                    [log.log(level, i) for i in info]
+
+                if count < max_tries:
+                    _log(logging.DEBUG)
+                    # This may only be due to items being out of order, so
+                    # retry silently
+                    retry.append((count + 1, (args, kwargs)))
+                else:
+                    # More than *max_tries* failures; something
+                    if fail == 'raise':
+                        _log(logging.ERROR)
+                        raise
+                    else:
+                        _log(getattr(logging, fail.upper()))
+
+        return added
+
+    # Generic graph manipulations
+    def add_single(self, key, *computation, strict=False, index=False):
+        """Add a single *computation* at *key*.
+
+        Parameters
+        ----------
+        key : str or Key or hashable
             A string, Key, or other value identifying the output of *task*.
-        computation: object
-            One of:
+        computation : object
+            Any dask computation, i.e. one of:
 
             1. any existing key in the Reporter.
             2. any other literal value or constant.
             3. a task, i.e. a tuple with a callable followed by one or more
                computations.
             4. A list containing one or more of #1, #2, and/or #3.
+
         strict : bool, optional
             If True, *key* must not already exist in the Reporter, and
             any keys referred to by *computation* must exist.
         index : bool, optional
             If True, *key* is added to the index as a full-resolution key, so
             it can be later retrieved with :meth:`full_key`.
-        sums : bool, optional
-            If True, all partial sums of *key* are also added to the Reporter.
-
-        Raises
-        ------
-        KeyError
-            If `key` is already in the Reporter; any key referred to by
-            `computation` does not exist; or ``sums=True`` and the key for one
-            of the partial sums of `key` is already in the Reporter.
         """
-        added = []
+        if len(computation) == 1:
+            # Unpack a length-1 tuple
+            computation = computation[0]
 
-        if sums:
-            key = Key.from_str_or_key(key)
-            to_add = chain([(key, computation)], key.iter_sums())
-        else:
-            to_add = [(key, computation)]
+        if strict:
+            if key in self.graph:
+                # Key already exists in graph
+                raise KeyExistsError(key)
 
-        for k, comp in to_add:
-            if strict:
-                if k in self.graph:
-                    # Key already exists in graph
-                    raise KeyExistsError(key)
+            # Check that keys used in *comp* are in the graph
+            keylike = filter(lambda e: isinstance(e, (str, Key)), computation)
+            self.check_keys(*keylike)
 
-                # Check that keys used in *comp* are in the graph
-                keylike = filter(lambda e: isinstance(e, (str, Key)), comp)
-                self.check_keys(*keylike)
+        if index:
+            # String equivalent of *key* with all dimensions dropped, but name
+            # and tag retained
+            idx = str(Key.from_str_or_key(key, drop=True)).rstrip(':')
 
-            if index:
-                # String equivalent of *key* with all dimensions dropped
-                idx = str(Key.from_str_or_key(key, drop=True)).rstrip(':')
+            # Add *key* to the index
+            self._index[idx] = key
 
-                # Add *key* to the index
-                self._index[idx] = key
+        # Add to the graph
+        self.graph[key] = computation
 
-                # Don't index further elements of to_add, e.g. sums
-                index = False
+        return key
 
-            self.graph[k] = comp
-            added.append(k)
-
-        return added if sums else added[0]
-
-    def apply(self, generator, *keys):
-        """Add computations from `generator` applied to `key`.
+    def apply(self, generator, *keys, **kwargs):
+        """Add computations by applying `generator` to `keys`.
 
         Parameters
         ----------
         generator : callable
-            Function to apply to `keys`. Must yield a sequence (0 or more) of
-            (`key`, `computation`), which are added to the :attr:`graph`.
+            Function to apply to `keys`.
         keys : hashable
-            The starting key(s)
+            The starting key(s).
+        kwargs
+            Keyword arguments to `generator`.
         """
-        keys = self.check_keys(*keys)
+        args = self.check_keys(*keys)
+
         try:
-            self.graph.update(generator(*keys))
-        except TypeError as e:
-            if e.args[0] == "'NoneType' object is not iterable":
-                pass
-            else:
-                raise
+            # Inspect the generator function
+            par = signature(generator).parameters
+            # Name of the first parameter
+            par_0 = list(par.keys())[0]
+        except IndexError:
+            pass  # No parameters to generator
+        else:
+            if issubclass(par[par_0].annotation, Reporter):
+                # First parameter wants a reference to the Reporter object
+                args.insert(0, self)
+
+        # Call the generator. Might return None, or yield some computations
+        applied = generator(*args, **kwargs)
+
+        if applied:
+            # Update the graph with the computations
+            self.graph.update(applied)
 
     def get(self, key=None):
         """Execute and return the result of the computation *key*.
@@ -315,11 +467,20 @@ class Reporter:
         log.debug('Cull {} -> {} keys'.format(len(self.graph), len(dsk)))
 
         try:
+            # Protect 'config' dict, so that dask schedulers do not try to
+            # interpret its contents as further tasks. Workaround for
+            # https://github.com/dask/dask/issues/3523
+            dsk['config'] = dask.core.quote(dsk['config'])
+        except KeyError:
+            pass
+
+        try:
             return dask_get(dsk, key)
         except Exception as exc:
-            raise ComputationError from exc
+            raise ComputationError(exc) from None
 
     def keys(self):
+        """Return the keys of :attr:`graph`."""
         return self.graph.keys()
 
     def full_key(self, name_or_key):
@@ -407,13 +568,15 @@ class Reporter:
                 self.graph['config']['filters'].pop(key, None)
 
     # ixmp data model manipulations
-    def add_product(self, name, *quantities, sums=True):
+    def add_product(self, key, *quantities, sums=True):
         """Add a computation that takes the product of *quantities*.
 
         Parameters
         ----------
-        name : str
-            Name of the new quantity.
+        key : str or Key
+            Key of the new quantity. If a Key, any dimensions are ignored; the
+            dimensions of the product are the union of the dimensions of
+            *quantities*.
         sums : bool, optional
             If :obj:`True`, all partial sums of the new quantity are also
             added.
@@ -428,17 +591,16 @@ class Reporter:
                              self.check_keys(*quantities)))
 
         # Compute a key for the result
-        key = Key.product(name, *base_keys)
+        # Parse the name and tag of the target
+        key = Key.from_str_or_key(key)
+        # New key with dimensions of the product
+        key = Key.product(key.name, *base_keys, tag=key.tag)
 
         # Add the basic product to the graph and index
-        self.add(key, tuple([computations.product] + base_keys))
-        self._index[name] = key
+        keys = self.add(key, computations.product, *base_keys, sums=sums,
+                        index=True)
 
-        if sums:
-            # Add partial sums of the product
-            self.apply(key.iter_sums)
-
-        return key
+        return keys[0]
 
     def aggregate(self, qty, tag, dims_or_groups, weights=None, keep=True,
                   sums=False):
@@ -520,21 +682,48 @@ class Reporter:
         if not callable(method):
             raise ValueError(method)
 
-        return self.add(key, tuple([method, qty] + args), True)
+        return self.add(key, tuple([method, qty] + args), strict=True)
 
     # Convenience methods
-    def add_file(self, path, key=None):
+    def add_file(self, path, key=None, **kwargs):
         """Add exogenous quantities from *path*.
 
-        A file at a path like '/path/to/foo.ext' is added at the key
-        ``'file:foo.ext'``.
+        Reporting the `key` or using it in other computations causes `path` to
+        be loaded and converted to :class:`.Quantity`.
+
+        Parameters
+        ----------
+        path : os.PathLike
+            Path to the file, e.g. '/path/to/foo.ext'.
+        key : str or .Key, optional
+            Key for the quantity read from the file.
+
+        Other parameters
+        ----------------
+        dims : dict or list or set
+            Either a collection of names for dimensions of the quantity, or a
+            mapping from names appearing in the input to dimensions.
+        units : str or pint.Unit
+            Units to apply to the loaded Quantity.
+
+        Returns
+        -------
+        .Key
+            Either `key` (if given) or e.g. ``file:foo.ext`` based on the
+            `path` name, without directory components.
 
         See also
         --------
         ixmp.reporting.computations.load_file
         """
+        path = Path(path)
         key = key if key else 'file:{}'.format(path.name)
-        return self.add(key, (partial(computations.load_file, path),), True)
+        return self.add(key,
+                        (partial(computations.load_file, path, **kwargs),),
+                        strict=True)
+
+    # Use add_file as a helper for computations.load_file
+    add_load_file = add_file
 
     def describe(self, key=None, quiet=True):
         """Return a string describing the computations that produce *key*.
@@ -568,6 +757,11 @@ class Reporter:
         # Call the method directly without adding it to the graph
         key = self.check_keys(key)[0]
         computations.write_report(self.get(key), path)
+
+    @property
+    def unit_registry(self):
+        """The :meth:`pint.UnitRegistry` used by the Reporter."""
+        return pint.get_application_registry()
 
 
 def configure(path=None, **config):
@@ -603,9 +797,9 @@ def configure(path=None, **config):
     units = config.get('units', {})
 
     # Define units
-    ureg = pint.get_application_registry()
+    registry = pint.get_application_registry()
     try:
-        ureg.define(units['define'].strip())
+        registry.define(units['define'].strip())
     except KeyError:
         pass
     except pint.DefinitionSyntaxError as e:
@@ -619,32 +813,27 @@ def configure(path=None, **config):
     RENAME_DIMS.update(config.get('rename_dims', {}))
 
 
-def _config_args(path, keys, sections={}):
+def _config_args(path=None, keys={}):
     """Handle configuration arguments."""
+    result = {}
+
     if path:
+        # Load configuration from file
         path = Path(path)
         with open(path, 'r') as f:
-            result = yaml.safe_load(f)
+            result.update(yaml.safe_load(f))
 
         # Also store the directory where the configuration file was located
         result['config_dir'] = path.parent
-    else:
-        result = {}
 
+    # Update with keys
     result.update(keys)
-
-    if sections:
-        extra_sections = set(result.keys()) - sections - {'config_dir'}
-        if len(extra_sections):
-            log.warning(('Unrecognized sections {!r} in reporting '
-                         'configuration will have no effect')
-                        .format(sorted(extra_sections)))
 
     return result
 
 
 def keys_for_quantity(ix_type, name, scenario):
-    """Iterate over keys for *name* in *scenario*."""
+    """Return keys for *name* in *scenario*."""
     # Retrieve names of the indices of the ixmp item, without loading the data
     dims = dims_for_qty(scenario.idx_names(name))
 
@@ -653,14 +842,20 @@ def keys_for_quantity(ix_type, name, scenario):
 
     # A computation to retrieve the data
     key = Key(name, dims)
-    yield (key, (partial(computations.data_for_quantity, ix_type, name,
-                         column), 'scenario', 'config'))
+    result = [(
+        key,
+        partial(computations.data_for_quantity, ix_type, name, column),
+        'scenario',
+        'config',
+    )]
 
     # Add the marginal values at full resolution, but no aggregates
     if ix_type == 'equ':
-        yield (Key('{}-margin'.format(name), dims),
-               (partial(computations.data_for_quantity, ix_type, name, 'mrg'),
-                'scenario', 'config'))
+        result.append((
+            Key('{}-margin'.format(name), dims),
+            partial(computations.data_for_quantity, ix_type, name, 'mrg'),
+            'scenario',
+            'config',
+        ))
 
-    # Partial sums
-    yield from key.iter_sums()
+    return result

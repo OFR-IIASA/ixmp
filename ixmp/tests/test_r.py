@@ -7,6 +7,11 @@ import sys
 import pytest
 
 
+pytestmark = pytest.mark.skip(
+    reason="Temporarily disabled; see https://github.com/iiasa/ixmp/issues/328"
+)
+
+
 @pytest.fixture
 def r_args(request, tmp_env, test_data_path, tmp_path_factory):
     """Arguments for subprocess calls to R."""
@@ -34,11 +39,14 @@ def test_r_build_and_check(r_args):
     cmd = ['R', 'CMD', 'build', '.']
     subprocess.check_call(cmd, **r_args)
 
-    cmd = ['R', 'CMD', 'check', '--no-examples']
+    cmd = ['R', 'CMD', 'check']
+    # - Do not run example snippets in R docstrings.
+    # - Do not build manual: avoids overhead of LaTeX install on AppVeyor;
+    #   errors on Travis/macOS
+    cmd.extend(['--no-examples', '--no-manual'])
     if 'APPVEYOR' in r_args['env']:
-        # - Do not cross-build/-check e.g. i386 on x64 Appveyor workers
-        # - Do not build manual (avoids overhead of LaTeX install)
-        cmd.extend(['--no-multiarch', '--no-manual'])
+        # Do not cross-build/-check e.g. i386 on x64 Appveyor workers
+        cmd.append('--no-multiarch')
     cmd.extend(map(str, r_args['cwd'].glob('*.tar.gz')))
     info = run(cmd, **r_args)
 

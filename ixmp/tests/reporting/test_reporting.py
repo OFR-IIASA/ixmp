@@ -1,4 +1,5 @@
 """Tests for ixmp.reporting."""
+import logging
 import os
 
 import ixmp
@@ -26,6 +27,8 @@ from ixmp.testing import (
     assert_qty_allclose,
     assert_qty_equal,
 )
+
+from . import add_test_data
 
 
 test_args = ('Douglas Adams', 'Hitchhiker')
@@ -87,9 +90,12 @@ def test_reporter_add():
 
     def msg(*keys):
         """Return a regex for str(MissingKeyError(*keys))."""
-        return 'required keys {!r} not defined'.format(tuple(keys)) \
-                                               .replace('(', '\\(') \
-                                               .replace(')', '\\)')
+        return (
+            f'required keys {repr(tuple(keys))} not defined'
+            .replace('(', '\\(')
+            .replace(')', '\\)')
+        )
+
     # One missing key
     with pytest.raises(MissingKeyError, match=msg('b')):
         r.add_product('ab', 'a', 'b')
@@ -117,6 +123,42 @@ def test_reporter_add():
     r.add('foo:a-b-c', [], sums=True)
     assert 'foo:b' in r
 
+    # add(name, ...) where name is the name of a computation
+    r.add('select', 'bar', 'a', indexers={'dim': ['d0', 'd1', 'd2']})
+
+    # add(name, ...) with keyword arguments not recognized by the computation
+    # raises an exception
+    msg = "unexpected keyword argument 'bad_kwarg'"
+    with pytest.raises(TypeError, match=msg):
+        r.add('select', 'bar', 'a', bad_kwarg='foo', index=True)
+
+
+def test_reporter_add_queue():
+    r = Reporter()
+    r.add('foo-0', (lambda x: x, 42))
+
+    # A computation
+    def _product(a, b):
+        return a * b
+
+    # A queue of computations to add. Only foo-1 succeeds on the first pass;
+    # only foo-2 on the second pass, etc.
+    strict = dict(strict=True)
+    queue = [
+        (('foo-4', _product, 'foo-3', 10), strict),
+        (('foo-3', _product, 'foo-2', 10), strict),
+        (('foo-2', _product, 'foo-1', 10), strict),
+        (('foo-1', _product, 'foo-0', 10), {}),
+    ]
+
+    # Maximum 3 attempts → foo-4 fails on the start of the 3rd pass
+    with pytest.raises(MissingKeyError, match='foo-3'):
+        r.add(queue, max_tries=3, fail='raise')
+
+    # But foo-2 was successfully added on the second pass, and gives the
+    # correct result
+    assert r.get('foo-2') == 42 * 10 * 10
+
 
 def test_reporter_add_product(test_mp, ureg):
     scen = ixmp.Scenario(test_mp, 'reporter_add_product',
@@ -131,9 +173,12 @@ def test_reporter_add_product(test_mp, ureg):
     assert key == 'x squared:t-y'
 
     # Product has the expected value
-    exp = as_quantity(x * x)
+    exp = as_quantity(x * x, name='x')
     exp.attrs['_unit'] = ureg('kilogram ** 2').units
     assert_qty_equal(exp, rep.get(key))
+
+    # add('product', ...) works
+    key = rep.add('product', 'x_squared', 'x', 'x', sums=True)
 
 
 def test_reporter_from_scenario(scenario):
@@ -209,18 +254,12 @@ def test_reporter_from_dantzig(test_mp, ureg):
     assert rep.full_key('d') == 'd:i-j' and isinstance(rep.full_key('d'), Key)
 
 
-def test_reporter_read_config(test_mp, test_data_path, caplog):
+def test_reporter_read_config(test_mp, test_data_path):
     scen = make_dantzig(test_mp)
-
     rep = Reporter.from_scenario(scen)
 
-    caplog.clear()
-
-    # Warning is raised when reading configuration with unrecognized section(s)
-    rep.read_config(test_data_path / 'report-config-0.yaml')
-
-    assert ("Unrecognized sections ['notarealsection'] in reporting "
-            "configuration will have no effect") == caplog.records[0].message
+    # Configuration can be read from file
+    rep.configure(test_data_path / 'report-config-0.yaml')
 
     # Data from configured file is available
     assert rep.get('d_check').loc['seattle', 'chicago'] == 1.7
@@ -238,7 +277,7 @@ def test_reporter_apply():
     def _product(a, b):
         return a * b
 
-    # A generator method that yields keys and computations
+    # A generator function that yields keys and computations
     def baz_qux(key):
         yield key + ':baz', (_product, key, 0.5)
         yield key + ':qux', (_product, key, 1.1)
@@ -267,12 +306,24 @@ def test_reporter_apply():
     assert r.get('foo:baz__bar:qux') == 42 * 0.5 * 11 * 1.1
 
     # A useless generator that does nothing
-    def useless(key):
+    def useless():
         return
-    r.apply(useless, 'foo:baz__bar:qux')
+    r.apply(useless)
 
     # Nothing added to the reporter
     assert len(r.keys()) == N
+
+    # Adding with a generator that takes Reporter as the first argument
+    def add_many(rep: Reporter, max=5):
+        [rep.add(f'foo{x}', _product, 'foo', x) for x in range(max)]
+
+    r.apply(add_many, max=10)
+
+    # Function was called, adding keys
+    assert len(r.keys()) == N + 10
+
+    # Keys work
+    assert r.get('foo9') == 42 * 9
 
 
 def test_reporter_disaggregate():
@@ -326,26 +377,40 @@ def test_reporter_file(tmp_path):
 def test_file_formats(test_data_path, tmp_path):
     r = Reporter()
 
-    expected = xr.DataArray.from_series(
-        pd.read_csv(test_data_path / 'report-input.csv',
-                    index_col=['i', 'j'])['value'])
+    expected = as_quantity(
+        pd.read_csv(test_data_path / 'report-input0.csv',
+                    index_col=['i', 'j'])['value'],
+        units='km')
 
     # CSV file is automatically parsed to xr.DataArray
-    p1 = test_data_path / 'report-input.csv'
-    k = r.add_file(p1)
+    p1 = test_data_path / 'report-input0.csv'
+    k = r.add_file(p1, units=pint.Unit('km'))
     assert_qty_equal(r.get(k), expected)
 
+    # Dimensions can be specified
+    p2 = test_data_path / 'report-input1.csv'
+    k2 = r.add_file(p2, dims=dict(i='i', j_dim='j'))
+    assert_qty_equal(r.get(k), r.get(k2))
+
+    # Units are loaded from a column
+    assert r.get(k2).attrs['_unit'] == pint.Unit('km')
+
+    # Specifying units that do not match file contents → ComputationError
+    r.add_file(p2, key='bad', dims=dict(i='i', j_dim='j'), units='kg')
+    with pytest.raises(ComputationError):
+        r.get('bad')
+
     # Write to CSV
-    p2 = tmp_path / 'report-output.csv'
-    r.write(k, p2)
+    p3 = tmp_path / 'report-output.csv'
+    r.write(k, p3)
 
     # Output is identical to input file, except for order
     assert (sorted(p1.read_text().split('\n'))
-            == sorted(p2.read_text().split('\n')))
+            == sorted(p3.read_text().split('\n')))
 
     # Write to Excel
-    p3 = tmp_path / 'report-output.xlsx'
-    r.write(k, p3)
+    p4 = tmp_path / 'report-output.xlsx'
+    r.write(k, p4)
     # TODO check the contents of the Excel file
 
 
@@ -378,11 +443,10 @@ def test_units(ureg):
     # Create some dummy data
     dims = dict(coords=['a b c'.split()], dims=['x'])
     r.add('energy:x',
-          Quantity(xr.DataArray([1., 3, 8], attrs={'_unit': 'MJ'}, **dims)))
+          as_quantity(xr.DataArray([1., 3, 8], **dims), units='MJ'))
     r.add('time',
-          Quantity(xr.DataArray([5., 6, 8], attrs={'_unit': 'hour'}, **dims)))
-    r.add('efficiency',
-          Quantity(xr.DataArray([0.9, 0.8, 0.95], **dims)))
+          as_quantity(xr.DataArray([5., 6, 8], **dims), units='hour'))
+    r.add('efficiency', as_quantity(xr.DataArray([0.9, 0.8, 0.95], **dims)))
 
     # Aggregation preserves units
     r.add('energy', (computations.sum, 'energy:x', None, ['x']))
@@ -441,8 +505,13 @@ def test_platform_units(test_mp, caplog, ureg):
     scen.add_par('x', x)
 
     # Unrecognized units are added automatically, with log messages emitted
-    with assert_logs(caplog, ['Add unit definition: kWa = [kWa]']):
-        rep.get(x_key)
+    caplog.clear()
+    rep.get(x_key)
+    # NB cannot use assert_logs here. reporting.utils.parse_units uses the
+    #    pint application registry, so depending which tests are run and in
+    #    which order, this unit may already be defined.
+    if len(caplog.messages):
+        assert 'Add unit definition: kWa = [kWa]' in caplog.messages
 
     # Mix of recognized/unrecognized units can be added: USD is already in the
     # unit registry, so is not re-added
@@ -459,19 +528,21 @@ def test_platform_units(test_mp, caplog, ureg):
     x.loc[0, 'unit'] = 'kg'
     scen.add_par('x', x)
 
-    with assert_logs(caplog, "x: mixed units ['kg', 'USD/pkm'] discarded"):
+    with assert_logs(caplog, "x: mixed units ['kg', 'USD/pkm'] discarded",
+                     at_level=logging.INFO):
         rep.get(x_key)
 
     # Configured unit substitutions are applied
     rep.graph['config']['units'] = dict(apply=dict(x='USD/pkm'))
 
-    with assert_logs(caplog, "x: replace units dimensionless with USD/pkm"):
+    with assert_logs(caplog, "x: replace units dimensionless with USD/pkm",
+                     at_level=logging.INFO):
         x = rep.get(x_key)
 
     # Applied units are pint objects with the correct dimensionality
     unit = x.attrs['_unit']
     assert isinstance(unit, pint.Unit)
-    assert unit.dimensionality == {'[USD]': 1, '[km]': -1}
+    assert unit.dimensionality == {'[USD]': 1, '[pkm]': -1}
 
 
 def test_reporter_describe(test_mp, test_data_path, capsys):
@@ -546,12 +617,16 @@ def test_cli(ixmp_cli, test_mp, test_data_path):
     # TODO warning should be logged
 
     # Reporting produces the expected command-line output
-    assert result.output.endswith("""<xarray.DataArray 'value' (i: 2, j: 3)>
-array([[1.8, 2.5, 1.4],
-       [1.7, 2.5, 1.8]])
-Coordinates:
-  * i        (i) object 'san-diego' 'seattle'
-  * j        (j) object 'chicago' 'new-york' 'topeka'
+    assert result.output.endswith(
+        "i          j       "  # Trailing whitespace
+        """
+seattle    new-york    2.5
+           chicago     1.7
+           topeka      1.8
+san-diego  new-york    2.5
+           chicago     1.8
+           topeka      1.4
+Name: value, dtype: float64
 """)
 
 
@@ -613,33 +688,6 @@ def test_report_size(test_mp):
 
     # All quantities together trigger MemoryError
     rep.get('bigmem')
-
-
-def add_test_data(scen):
-    # New sets
-    t_foo = ['foo{}'.format(i) for i in (1, 2, 3)]
-    t_bar = ['bar{}'.format(i) for i in (4, 5, 6)]
-    t = t_foo + t_bar
-    y = list(map(str, range(2000, 2051, 10)))
-
-    # Add to scenario
-    scen.init_set('t')
-    scen.add_set('t', t)
-    scen.init_set('y')
-    scen.add_set('y', y)
-
-    # Data
-    x = xr.DataArray(np.random.rand(len(t), len(y)),
-                     coords=[t, y], dims=['t', 'y'])
-
-    # As a pd.DataFrame with units
-    x_df = x.to_series().rename('value').reset_index()
-    x_df['unit'] = 'kg'
-
-    scen.init_par('x', ['t', 'y'])
-    scen.add_par('x', x_df)
-
-    return t, t_foo, t_bar, x
 
 
 def test_aggregate(test_mp):
@@ -738,10 +786,7 @@ def test_filters(test_mp, tmp_path, caplog):
 
     # Write a temporary file containing the desired labels
     config_file = tmp_path / 'config.yaml'
-    config_file.write_text('\n'.join([
-        'filters:',
-        '  t: {!r}'.format(t_bar),
-    ]))
+    config_file.write_text('\n'.join(['filters:', f'  t: {repr(t_bar)}']))
 
     rep.configure(config_file)
     assert_t_indices(t_bar)

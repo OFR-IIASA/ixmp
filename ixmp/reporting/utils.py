@@ -39,16 +39,16 @@ def clean_units(input_string):
 
 def collect_units(*args):
     """Return an list of '_unit' attributes for *args*."""
-    ureg = pint.get_application_registry()
+    registry = pint.get_application_registry()
 
     for arg in args:
         if '_unit' in arg.attrs:
             # Convert units if necessary
             if isinstance(arg.attrs['_unit'], str):
-                arg.attrs['_unit'] = ureg.parse_units(arg.attrs['_unit'])
+                arg.attrs['_unit'] = registry.parse_units(arg.attrs['_unit'])
         else:
             log.debug('assuming {} is unitless'.format(arg))
-            arg.attrs['_unit'] = ureg.parse_units('')
+            arg.attrs['_unit'] = registry.parse_units('')
 
     return [arg.attrs['_unit'] for arg in args]
 
@@ -85,7 +85,7 @@ def filter_concat_args(args):
     """
     for arg in args:
         if isinstance(arg, (str, Key)):
-            log.warn('concat() argument {arg!r} missing; will be omitted')
+            log.warn('concat() argument {repr(arg)} missing; will be omitted')
             continue
         yield arg
 
@@ -97,47 +97,52 @@ def get_reversed_rename_dims():
 
 def parse_units(units_series):
     """Return a :class:`pint.Unit` for a :class:`pd.Series` of strings."""
-    ureg = pint.get_application_registry()
-
     unit = pd.unique(units_series)
 
     if len(unit) > 1:
-        raise ValueError(f'mixed units {list(unit)!r}')
+        raise ValueError(f'mixed units {list(unit)}')
+
+    registry = pint.get_application_registry()
 
     # Helper method to return an intelligible exception
     def invalid(unit):
         chars = ''.join(c for c in '-?$' if c in unit)
-        return ValueError(("unit {!r} cannot be parsed; contains invalid "
-                           "character(s) {!r}").format(unit, chars))
+        msg = (f'unit {repr(unit)} cannot be parsed; contains invalid '
+               f'character(s) {repr(chars)}')
+        return ValueError(msg)
+
+    # Helper method to add unit definitions
+    def define_unit_parts(expr):
+        # Split possible compound units
+        for part in expr.split('/'):
+            try:
+                registry.parse_units(part)
+            except pint.UndefinedUnitError:
+                # Part was unparseable; define it
+                definition = f'{part} = [{part}]'
+                log.info(f'Add unit definition: {definition}')
+
+                # This line will fail silently for parts like 'G$' containing
+                # characters like '$' that are discarded by pint
+                registry.define(definition)
 
     # Parse units
     try:
         unit = clean_units(unit[0])
-        unit = ureg.parse_units(unit)
+        unit = registry.parse_units(unit)
     except IndexError:
         # Quantity has no unit
-        unit = ureg.parse_units('')
+        unit = registry.parse_units('')
     except pint.UndefinedUnitError:
         # Unit(s) do not exist; define them in the UnitRegistry
-
-        # Split possible compound units
-        for u in unit.split('/'):
-            if u in dir(ureg):
-                # Unit already defined
-                continue
-
-            definition = f'{u} = [{u}]'
-            log.info(f'Add unit definition: {definition}')
-
-            # This line will fail silently for units like 'G$'
-            ureg.define(definition)
+        define_unit_parts(unit)
 
         # Try to parse again
         try:
-            unit = ureg.parse_units(unit)
+            unit = registry.parse_units(unit)
         except pint.UndefinedUnitError:
             # Handle the silent failure of define(), above
-            raise invalid(unit) from None
+            raise invalid(unit)  # from None
     except AttributeError:
         # Unit contains a character like '-' that throws off pint
         # NB this 'except' clause must be *after* UndefinedUnitError, since

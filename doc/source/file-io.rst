@@ -27,10 +27,10 @@ The files have the following structure:
   - 'item': the name of an ixmp item.
   - 'ix_type': the item's type as a length-3 string: 'set', 'par', 'var', or 'equ'.
 
-- One sheet per item.
+- One or more sheet per item. If the length of data is greater than the maximum number of rows per sheet supported by the Excel file format (:data:`.EXCEL_MAX_ROWS`), the item is split across multiple sheets named, e.g., 'foo', 'foo(2)', 'foo(3)'.
+
 - Sets:
 
-  - Sheets for index sets have one column, with a header cell that is the set name.
   - Sheets for one-dimensional indexed sets have one column, with a header cell that is the index set name.
   - Sheets for multi-dimensional indexed sets have multiple columns.
   - Sets with no elements are represented by empty sheets.
@@ -49,6 +49,8 @@ Reading variables and equations
    The ixmp API provides no way to set the data of variables and equations, because these are considered model solution data.
 
    Thus, while :meth:`.to_excel` will write files containing variable and equation data, :meth:`.read_excel` can not add these to a Scenario, and only emits log messages indicating that they are ignored.
+
+.. _excel-ambiguous-dims:
 
 Multiple dimensions indexed by the same set
    :meth:`.read_excel` provides the `init_items` argument to create new sets and parameters when reading a file.

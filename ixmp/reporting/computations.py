@@ -2,6 +2,7 @@
 # Notes:
 # - To avoid ambiguity, computations should not have default arguments. Define
 #   default values for the corresponding methods on the Reporter class.
+from collections.abc import Mapping
 import logging
 from pathlib import Path
 
@@ -21,12 +22,14 @@ from .utils import (
 
 __all__ = [
     'aggregate',
+    'apply_units',
     'concat',
     'data_for_quantity',
     'disaggregate_shares',
     'load_file',
     'product',
     'ratio',
+    'select',
     'sum',
     'write_report',
 ]
@@ -34,9 +37,47 @@ __all__ = [
 
 log = logging.getLogger(__name__)
 
-
 # Carry unit attributes automatically
 xr.set_options(keep_attrs=True)
+
+
+def apply_units(qty, units, quiet=False):
+    """Simply apply *units* to *qty*.
+
+    Logs on level ``WARNING`` if *qty* already has existing units.
+
+    Parameters
+    ----------
+    qty : .Quantity
+    units : str or pint.Unit
+        Units to apply to *qty*
+    quiet : bool, optional
+        If :obj:`True` log on level ``DEBUG``.
+    """
+    registry = pint.get_application_registry()
+
+    existing = qty.attrs.get('_unit', None)
+    existing_dims = getattr(existing, 'dimensionality', {})
+    new_units = registry.parse_units(units)
+
+    if len(existing_dims):
+        # Some existing dimensions: log a message either way
+        if existing_dims == new_units.dimensionality:
+            log.debug(f"Convert '{existing}' to '{new_units}'")
+            # NB use a factor because pint.Quantity cannot wrap AttrSeries
+            factor = registry.Quantity(1.0, existing).to(new_units).magnitude
+            result = qty * factor
+        else:
+            msg = f"Replace '{existing}' with incompatible '{new_units}'"
+            log.warning(msg)
+            result = qty.copy()
+    else:
+        # No units, or dimensionless
+        result = qty.copy()
+
+    result.attrs['_unit'] = new_units
+
+    return result
 
 
 def data_for_quantity(ix_type, name, column, scenario, config):
@@ -66,7 +107,7 @@ def data_for_quantity(ix_type, name, column, scenario, config):
     """
     log.debug(f'{name}: retrieve data')
 
-    ureg = pint.get_application_registry()
+    registry = pint.get_application_registry()
 
     # Only use the relevant filters
     idx_names = scenario.idx_names(name)
@@ -97,8 +138,10 @@ def data_for_quantity(ix_type, name, column, scenario, config):
     # TODO construct an empty Quantity with the correct dimensions *even if* no
     #      values are returned.
     if len(data) == 0:
-        log.warning(f'0 values for {ix_type} {name!r} using filters:'
-                    f'\n  {filters!r}\n  Subsequent computations may fail.')
+        log.warning(
+            f'0 values for {ix_type} {repr(name)} using filters:\n'
+            f'  {repr(filters)}\n  Subsequent computations may fail.'
+        )
 
     # Convert categorical dtype to str
     data = data.astype({col: str for col in idx_names})
@@ -116,7 +159,7 @@ def data_for_quantity(ix_type, name, column, scenario, config):
         if 'mixed units' in e.args[0]:
             # Discard mixed units
             log.warning(f'{name}: {e.args[0]} discarded')
-            attrs = {'_unit': ureg.parse_units('')}
+            attrs = {'_unit': registry.Unit('')}
         else:
             # Raise all other ValueErrors
             raise
@@ -127,8 +170,9 @@ def data_for_quantity(ix_type, name, column, scenario, config):
     except KeyError:
         pass
     else:
-        log.info(f"{name}: replace units {attrs['_unit']} with {new_unit}")
-        attrs['_unit'] = ureg.parse_units(new_unit)
+        log.info(f"{name}: replace units {attrs.get('_unit', '(none)')} with "
+                 f"{new_unit}")
+        attrs['_unit'] = registry.Unit(new_unit)
 
     # Set index if 1 or more dimensions
     if len(dims):
@@ -161,21 +205,6 @@ def data_for_quantity(ix_type, name, column, scenario, config):
     return qty
 
 
-# Calculation
-# TODO: should we call this weighted sum?
-def sum(quantity, weights=None, dimensions=None):
-    """Sum *quantity* over *dimensions*, with optional *weights*."""
-    if weights is None:
-        weights, w_total = 1, 1
-    else:
-        w_total = weights.sum(dim=dimensions)
-
-    result = (quantity * weights).sum(dim=dimensions) / w_total
-    result.attrs['_unit'] = collect_units(quantity)[0]
-
-    return result
-
-
 def aggregate(quantity, groups, keep):
     """Aggregate *quantity* by *groups*.
 
@@ -200,6 +229,8 @@ def aggregate(quantity, groups, keep):
     #   can be removed when Quantity = xr.DataArray.
     dim_order = quantity.dims
 
+    attrs = quantity.attrs.copy()
+
     for dim, dim_groups in groups.items():
         # Optionally keep the original values
         values = [quantity] if keep else []
@@ -213,6 +244,9 @@ def aggregate(quantity, groups, keep):
 
         # Reassemble to a single dataarray
         quantity = concat(*values, dim=dim)
+
+    # Preserve attrs
+    quantity.attrs = attrs
 
     return quantity
 
@@ -274,7 +308,13 @@ def product(*quantities):
 
 
 def ratio(numerator, denominator):
-    """Return the ratio *numerator* / *denominator*."""
+    """Return the ratio *numerator* / *denominator*.
+
+    Parameters
+    ----------
+    numerator : .Quantity
+    denominator : .Quantity
+    """
     # Handle units
     u_num, u_denom = collect_units(numerator, denominator)
 
@@ -287,25 +327,113 @@ def ratio(numerator, denominator):
     return result
 
 
+def select(qty, indexers, inverse=False):
+    """Select from *qty* based on *indexers*.
+
+    Parameters
+    ----------
+    qty : .Quantity
+    select : dict (str -> list of str)
+        Elements to be selected from *qty*. Mapping from dimension names to
+        labels along each dimension.
+    inverse : bool, optional
+        If :obj:`True`, *remove* the items in indexers instead of keeping them.
+    """
+    if inverse:
+        new_indexers = {}
+        for dim, labels in indexers.items():
+            new_indexers[dim] = list(filter(lambda l: l not in labels,
+                                            qty.coords[dim]))
+        indexers = new_indexers
+
+    return qty.sel(indexers)
+
+
+def sum(quantity, weights=None, dimensions=None):
+    """Sum *quantity* over *dimensions*, with optional *weights*.
+
+    Parameters
+    ----------
+    quantity : .Quantity
+    weights : .Quantity, optional
+        If *dimensions* is given, *weights* must have at least these
+        dimensions. Otherwise, any dimensions are valid.
+    dimensions : list of str, optional
+        If not provided, sum over all dimensions. If provided, sum over these
+        dimensions.
+    """
+    if weights is None:
+        weights, w_total = 1, 1
+    else:
+        w_total = weights.sum(dim=dimensions)
+
+    result = (quantity * weights).sum(dim=dimensions) / w_total
+    result.attrs['_unit'] = collect_units(quantity)[0]
+
+    return result
+
+
 # Input and output
-def load_file(path):
-    """Read the file at *path* and return its contents.
+def load_file(path, dims={}, units=None):
+    """Read the file at *path* and return its contents as a :class:`.Quantity`.
 
     Some file formats are automatically converted into objects for direct use
     in reporting code:
 
-    - *csv*: converted to :class:`xarray.DataArray`. CSV files must have a
-      'value' column; all others are treated as indices.
+    :file:`.csv`:
+       Converted to :class:`.Quantity`. CSV files must have a 'value' column;
+       all others are treated as indices, except as given by `dims`. Lines
+       beginning with '#' are ignored.
 
+    Parameters
+    ----------
+    path : pathlib.Path
+        Path to the file to read.
+    dims : collections.abc.Collection or collections.abc.Mapping, optional
+        If a collection of names, other columns besides these and 'value' are
+        discarded. If a mapping, the keys are the column labels in `path`, and
+        the values are the target dimension names.
+    units : str or pint.Unit
+        Units to apply to the loaded Quantity.
     """
     # TODO optionally cache: if the same Reporter is used repeatedly, then the
     #      file will be read each time; instead cache the contents in memory.
     if path.suffix == '.csv':
-        # TODO handle a wider variety of CSV files
-        data = pd.read_csv(path)
+        data = pd.read_csv(path, comment='#')
+
+        # Index columns
         index_columns = data.columns.tolist()
         index_columns.remove('value')
-        return xr.DataArray.from_series(data.set_index(index_columns)['value'])
+
+        try:
+            # Retrieve the unit column from the file
+            units_col = data.pop('unit').unique()
+            index_columns.remove('unit')
+        except KeyError:
+            pass  # No such column; use None or argument value
+        else:
+            # Use a unique value for units of the quantity
+            if len(units_col) > 1:
+                raise ValueError(f'Cannot load {path} with non-unique units '
+                                 + repr(units_col))
+            elif units and units not in units_col:
+                raise ValueError(f'Explicit units {units} do not match '
+                                 f'{units_col[0]} in {path}')
+            units = units_col[0]
+
+        if len(dims):
+            # Use specified dimensions
+            if not isinstance(dims, Mapping):
+                # Convert a list, set, etc. to a dict
+                dims = {d: d for d in dims}
+
+            # - Drop columns not mentioned in *dims*
+            # - Rename columns according to *dims*
+            data = data.drop(columns=set(index_columns) - set(dims.keys())) \
+                       .rename(columns=dims)
+            index_columns = list(dims.values())
+
+        return as_quantity(data.set_index(index_columns)['value'], units=units)
     elif path.suffix in ('.xls', '.xlsx'):
         # TODO define expected Excel data input format
         raise NotImplementedError  # pragma: no cover

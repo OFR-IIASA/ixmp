@@ -2,9 +2,10 @@ click
 codecov
 dask
 graphviz
-JPype1!=0.7.2
+JPype1
 jupyter
 numpydoc
+memory_profiler
 pandas
 pint
 pytest-cov

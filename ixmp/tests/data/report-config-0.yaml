@@ -5,7 +5,15 @@ default: all
 
 # Exogenous data from files
 files:
-  d_check: ./report-input.csv
+- path: ./report-input0.csv
+  key: d_check
+# 'dims' argument can be supplied as list or dict
+- path: ./report-input1.csv
+  key: report-input1-0
+  dims: [i, j_dim]  # Omit extra dimension 'foo'
+- path: ./report-input1.csv
+  key: report-input1-1
+  dims: {i: i, j_dim: j}
 
 # Aliases
 alias:
@@ -13,7 +21,5 @@ alias:
 
 # Unrecognized section raises a warning
 notarealsection:
-  - 0
-  - 1
-
-# TODO specify format for other configurable aspects of reporting
+- 0
+- 1

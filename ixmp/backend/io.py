@@ -1,11 +1,17 @@
+from collections import deque
 import logging
 
 import pandas as pd
 
 from ixmp.utils import as_str_list
+from . import ItemType
 
 
 log = logging.getLogger(__name__)
+
+#: Maximum number of rows supported by the Excel file format. See
+#: :meth:`.to_excel` and :ref:`excel-data-format`.
+EXCEL_MAX_ROWS = 1048576
 
 
 def ts_read_file(ts, path, firstyear=None, lastyear=None):
@@ -33,22 +39,34 @@ def ts_read_file(ts, path, firstyear=None, lastyear=None):
     ts.commit(msg)
 
 
-def s_write_excel(be, s, path):
+def s_write_excel(be, s, path, item_type, max_row=None):
     """Write *s* to a Microsoft Excel file at *path*.
 
     See also
     --------
     Scenario.to_excel
     """
+    # Types of items to write
+    ix_types = ['set', 'par']
+    if ItemType.VAR in item_type:
+        ix_types.append('var')
+    if ItemType.EQU in item_type:
+        ix_types.append('equ')
+
     # item name -> ixmp type
     name_type = {}
-    for ix_type in ('set', 'par', 'var', 'equ'):
-        name_type.update({n: ix_type for n in be.list_items(s, ix_type)})
+    for ix_type in ix_types:
+        names = sorted(be.list_items(s, ix_type))
+        name_type.update({n: ix_type for n in names})
 
     # Open file
     writer = pd.ExcelWriter(path, engine='xlsxwriter')
 
     omitted = set()
+    empty_sets = []
+
+    # Don't allow the user to set a value that will truncate data
+    max_row = min(int(max_row or EXCEL_MAX_ROWS), EXCEL_MAX_ROWS)
 
     for name, ix_type in name_type.items():
         # Extract data: dict, pd.Series, or pd.DataFrame
@@ -64,12 +82,29 @@ def s_write_excel(be, s, path):
             # Index set: use own name as the header
             data.name = name
 
-        # Write empty sets, but not equ/par/var
-        if ix_type != 'set' and data.empty:
-            omitted.add(name)
+        if data.empty:
+            if ix_type != 'set':
+                # Don't write empty equ/par/var
+                omitted.add(name)
+            else:
+                # Write empty sets later
+                empty_sets.append((name, data))
             continue
 
-        data.to_excel(writer, sheet_name=name, index=False)
+        # Write data in multiple sheets
+
+        # List of break points, plus the final row
+        splits = list(range(0, len(data), max_row)) + [len(data)]
+        # Pairs of row numbers, e.g. (0, 100), (100, 200), ...
+        first_last = zip(splits, splits[1:])
+
+        for sheet_num, (first_row, last_row) in enumerate(first_last, start=1):
+            # Format the sheet name, possibly with a suffix
+            sheet_name = name + (f'({sheet_num})' if sheet_num > 1 else '')
+
+            # Subset the data (only on rows, if a DataFrame) and write
+            data.iloc[first_row:last_row] \
+                .to_excel(writer, sheet_name, index=False)
 
     # Discard entries that were not written
     for name in omitted:
@@ -80,6 +115,10 @@ def s_write_excel(be, s, path):
       .rename_axis(index='item') \
       .reset_index() \
       .to_excel(writer, sheet_name='ix_type_mapping', index=False)
+
+    # Write empty sets last
+    for name, data in empty_sets:
+        data.to_excel(writer, sheet_name=name, index=False)
 
     writer.save()
 
@@ -103,9 +142,10 @@ def maybe_init_item(scenario, ix_type, name, new_idx, path):
         # Check for ambiguous index names
         ambiguous_idx = sorted(set(new_idx or []) - set(scenario.set_list()))
         if len(ambiguous_idx):
-            msg = (f'Cannot read {ix_type} {name!r}: index set(s) cannot be '
-                   f'inferred for name(s) {ambiguous_idx}')
-            log.warning(msg)
+            log.warning(
+                f'Cannot read {ix_type} {repr(name)}: index set(s) cannot be '
+                f'inferred for name(s) {ambiguous_idx}'
+            )
             raise ValueError from None
 
         # Initialize
@@ -118,9 +158,10 @@ def maybe_init_item(scenario, ix_type, name, new_idx, path):
             new_idx = None
 
         if existing_names != new_idx:
-            msg = (f'Existing {ix_type} {name!r} has index names(s) '
-                   f' {existing_names} != {new_idx} in {path.name}')
-            log.warning(msg)
+            log.warning(
+                f'Existing {ix_type} {repr(name)} has index names(s) '
+                f' {existing_names} != {new_idx} in {path.name}'
+            )
             raise ValueError from None
 
 
@@ -138,56 +179,77 @@ def s_read_excel(be, s, path, add_units=False, init_items=False,
     xf = pd.ExcelFile(path)
     name_type = xf.parse('ix_type_mapping', index_col='item')['ix_type']
 
-    # List of *set name, data) to add
-    sets_to_add = [(n, None) for n in name_type.index[name_type == 'set']]
+    # Queue of (set name, data) to add
+    sets_to_add = deque((n, None) for n in name_type.index[name_type == 'set'])
+
+    def parse_item_sheets(name):
+        """Read data for item *name*, possibly across multiple sheets."""
+        dfs = [xf.parse(name)]
+
+        # Collect data from repeated sheets due to max_row limit
+        for x in filter(lambda n: n.startswith(name + '('), xf.sheet_names):
+            dfs.append(xf.parse(x))
+
+        # Concatenate once and return
+        return pd.concat(dfs, axis=1)
 
     # Add sets in two passes:
     # 1. Index sets, required to initialize other sets.
     # 2. Sets indexed by others.
-    for name, data in sets_to_add:
+    while True:
+        try:
+            # Get an item from the queue
+            name, data = sets_to_add.popleft()
+        except IndexError:
+            break  # Finished
+
+        log.info(name)
+
         first_pass = data is None
         if first_pass:
             # Read data
-            data = xf.parse(name)
+            data = parse_item_sheets(name)
 
-        if (first_pass and len(data.columns) == 1) or not first_pass:
-            # Index set or second appearance; add immediately
-            idx_sets = data.columns.to_list()
+        # Determine index set(s) for this set
+        idx_sets = data.columns.to_list()
+        if len(idx_sets) == 1:
+            if idx_sets == [0]:  # pragma: no cover
+                # Old-style export with uninformative '0' as a column header;
+                # assume it is an index set
+                log.warning(f"Add {name} with header '0' as index set")
+                idx_sets = None
+            elif idx_sets == [name]:
+                # Set's own name as column header -> an index set
+                idx_sets = None
+            else:
+                pass  # 1-D set indexed by another set
 
-            if init_items:
-                # Determine index set(s) for this set
-                if len(idx_sets) == 1:
-                    if idx_sets == [0]:  # pragma: no cover
-                        # Old-style export with uninformative '0' as a column
-                        # header; assume it's an index set
-                        log.warning(f"Add {name} with header '0' as index set")
-                        idx_sets = None
-                    elif idx_sets == [name]:
-                        # Set's own name as column header -> an index set
-                        idx_sets = None
-                    else:
-                        pass  # 1-D set indexed by another set
-
-                try:
-                    maybe_init_item(s, 'set', name, idx_sets, path)
-                except ValueError:
-                    continue  # Ambiguous or conflicting; skip this set
-
-            if len(data.columns) == 1:
-                # Convert data frame into 1-D vector
-                data = data.iloc[:, 0].values
-
-                if idx_sets is not None and idx_sets != [name]:
-                    # Indexed set must be input as list of list of str
-                    data = list(map(as_str_list, data))
-
-            try:
-                s.add_set(name, data)
-            except KeyError:
-                raise ValueError(f'no set {name!r}; try init_items=True')
-        else:
-            # Reappend to the list to process later
+        if first_pass and idx_sets is not None:
+            # Indexed set; append to the queue to process later
             sets_to_add.append((name, data))
+            continue
+
+        # At this point: either an index set, or second pass when all index
+        # sets have been init'd and populated
+        if init_items:
+            try:
+                maybe_init_item(s, 'set', name, idx_sets, path)
+            except ValueError:
+                continue  # Ambiguous or conflicting; skip this set
+
+        # Convert data as expected by add_set
+        if len(data.columns) == 1:
+            # Convert data frame into 1-D vector
+            data = data.iloc[:, 0].values
+
+            if idx_sets is not None:
+                # Indexed set must be input as list of list of str
+                data = list(map(as_str_list, data))
+
+        try:
+            s.add_set(name, data)
+        except KeyError:
+            raise ValueError(f'no set {repr(name)}; try init_items=True')
 
     if commit_steps:
         s.commit(f'Loaded sets from {path}')
@@ -200,12 +262,12 @@ def s_read_excel(be, s, path, add_units=False, init_items=False,
     # Add equ/par/var data
     for name, ix_type in name_type[name_type != 'set'].items():
         if ix_type in ('equ', 'var'):
-            log.info(f'Cannot read {ix_type} {name!r}')
+            log.info(f'Cannot read {ix_type} {repr(name)}')
             continue
 
         # Only parameters beyond this point
 
-        df = xf.parse(name)
+        df = parse_item_sheets(name)
 
         if add_units:
             # New units appearing in this parameter
@@ -241,5 +303,5 @@ def s_read_excel(be, s, path, add_units=False, init_items=False,
 
         if commit_steps:
             # Commit after every parameter
-            s.commit(f'Loaded {ix_type} {name!r} from {path}')
+            s.commit(f'Loaded {ix_type} {repr(name)} from {path}')
             s.check_out()

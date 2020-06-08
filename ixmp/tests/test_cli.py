@@ -168,7 +168,6 @@ def test_import_ts(ixmp_cli, test_mp, test_data_path):
         'region': ['World'],
         'variable': ['Testing'],
         'unit': ['???'],
-        'subannual': ['Year'],
         'year': [2020],
         'value': [28.3],
         'model': ['canning problem'],
@@ -195,6 +194,12 @@ def test_excel_io(ixmp_cli, test_mp, tmp_path):
         '--scenario', models['dantzig']['scenario'],
         'export', str(tmp_path),
     ]
+    result = ixmp_cli.invoke(cmd)
+    assert result.exit_code == 0, result.output
+
+    # Export with a maximum row limit per sheet
+    tmp_path2 = tmp_path.with_name('dantzig2.xlsx')
+    cmd = cmd[:-1] + [str(tmp_path2), '--max-row', 2]
     result = ixmp_cli.invoke(cmd)
     assert result.exit_code == 0, result.output
 
@@ -238,8 +243,60 @@ def test_excel_io(ixmp_cli, test_mp, tmp_path):
     result = ixmp_cli.invoke(cmd)
     assert result.exit_code == 0, result.output
 
+    # Import from a file that has multiple sheets (due to row limit)
+    cmd[cmd.index(str(tmp_path))] = str(tmp_path2)
+    result = ixmp_cli.invoke(cmd)
+    assert result.exit_code == 0, result.output
+
 
 def test_report(ixmp_cli):
     # 'report' without specifying a platform/scenario is a UsageError
     result = ixmp_cli.invoke(['report', 'key'])
     assert result.exit_code == UsageError.exit_code
+
+
+@pytest.mark.usefixtures('protect_pint_app_registry')
+def test_show_versions(ixmp_cli):
+    result = ixmp_cli.invoke(['show-versions'])
+    assert result.exit_code == 0, result.output
+
+
+def test_solve(ixmp_cli, test_mp):
+    populate_test_platform(test_mp)
+    cmd = [
+        '--platform', test_mp.name,
+        '--model', models['dantzig']['model'],
+        '--scenario', models['dantzig']['scenario'],
+        'solve', '--remove-solution'
+    ]
+    result = ixmp_cli.invoke(cmd)
+    assert result.exit_code == 0, result.output
+
+    # test failing solving without solution removal
+    cmd = [
+        '--platform', test_mp.name,
+        '--model', models['dantzig']['model'],
+        '--scenario', models['dantzig']['scenario'],
+        'solve'
+    ]
+    result = ixmp_cli.invoke(cmd)
+    assert result.exit_code == 1, result.output
+
+    # missing scenario
+    cmd = [
+        '--platform', test_mp.name,
+        '--model', 'non-existing',
+        '--scenario', models['dantzig']['scenario'],
+        'solve'
+    ]
+    result = ixmp_cli.invoke(cmd)
+    assert result.exit_code == 1, result.output
+    assert "Error: model='non-existing'" in result.output
+
+    # no platform/scenario provided
+    cmd = [
+        'solve'
+    ]
+    result = ixmp_cli.invoke(cmd)
+    assert result.exit_code != 0, result.output
+    assert "Error: give --url before command solve" in result.output

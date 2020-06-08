@@ -9,6 +9,8 @@ ScenarioClass = ixmp.Scenario
 
 class VersionType(click.ParamType):
     """A Click parameter type that accepts :class:`int` or 'all'."""
+    name = 'version'  # https://github.com/pallets/click/issues/411
+
     def convert(self, value, param, ctx):
         if value == 'new':
             return value
@@ -18,7 +20,7 @@ class VersionType(click.ParamType):
             try:
                 return int(value)
             except ValueError:
-                self.fail(f"{value!r} must be an integer or 'new'")
+                self.fail(f"{repr(value)} must be an integer or 'new'")
 
 
 @click.group()
@@ -33,12 +35,13 @@ class VersionType(click.ParamType):
 @click.pass_context
 def main(ctx, url, platform, dbprops, model, scenario, version):
     # Load the indicated Platform
+    mp = None
     if url:
         if dbprops or platform or model or scenario or version:
             raise click.UsageError('--platform --model --scenario and/or '
                                    '--version redundant with --url')
 
-        scen, mp = ixmp.Scenario.from_url(url)
+        scen, mp = ScenarioClass.from_url(url)
         ctx.obj = dict(scen=scen, mp=mp)
         return
     elif dbprops and platform:
@@ -48,10 +51,10 @@ def main(ctx, url, platform, dbprops, model, scenario, version):
     elif dbprops:
         mp = ixmp.Platform(backend='jdbc', dbprops=dbprops)
 
-    try:
-        ctx.obj = dict(mp=mp)
-    except NameError:
+    if not mp:
         return
+
+    ctx.obj = dict(mp=mp)
 
     # Store the model and scenario name from arguments
     if model:
@@ -62,11 +65,9 @@ def main(ctx, url, platform, dbprops, model, scenario, version):
 
     try:
         # Load the indicated Scenario
-        ctx.obj['scen'] = ScenarioClass(mp, ctx.obj['model name'],
-                                        ctx.obj['scenario name'],
-                                        version=version)
-    except KeyError:
-        pass
+        if model and scenario:
+            ctx.obj['scen'] = ScenarioClass(mp, model, scenario,
+                                            version=version)
     except Exception as e:  # pragma: no cover
         raise click.ClickException(e.args[0])
 
@@ -88,11 +89,43 @@ def report(context, config, key):
     r = Reporter.from_scenario(context['scen'])
 
     # Read the configuration file, if any
-    if config:
-        r.read_config(config)
+    r.configure(config)
 
     # Print the target
     print(r.get(key))
+
+
+@main.command('show-versions')
+def show_versions_cmd():
+    """Print versions of ixmp and its dependencies."""
+    ixmp.show_versions()
+
+
+@main.command()
+@click.option('--remove-solution', is_flag=True, default=False,
+              help='Forces removing solution if exists.')
+@click.pass_obj
+def solve(context, remove_solution):
+    """Solve a Scenario and store results on the Platform.
+
+    The scenario indicated by --url or --platform/--model/--scenario/--version
+    is loaded, solved, and the solution results are saved on the Platform.
+
+    If the scenario already has a solution, --remove-solution must be given.
+    """
+    if not context:
+        raise click.UsageError('give --url before command solve')
+
+    print('Run scenario solver')
+    scen = context.get('scen')
+    if not scen:
+        print('Scenario not found')
+        return
+    if remove_solution and scen.has_solution():
+        scen.remove_solution()
+        print('Solution removed')
+    scen.solve()
+    print('Solver finished')
 
 
 @main.command()
@@ -113,9 +146,10 @@ def config(action, key, value):
 
 
 @main.command()
+@click.option('--max-row', type=int, help='Max row numbers in each sheet.')
 @click.argument('path', type=click.Path(writable=True))
 @click.pass_obj
-def export(context, path):
+def export(context, path, max_row):
     """Export scenario data to PATH."""
     # NB want to use type=click.Path(..., path_type=Path), but fails on bytes
     path = Path(path)
@@ -124,7 +158,7 @@ def export(context, path):
         raise click.UsageError('give --url, or --platform, --model, and '
                                '--scenario, before export')
 
-    context['scen'].to_excel(path)
+    context['scen'].to_excel(path, max_row=max_row)
 
 
 @main.group('import')
@@ -196,7 +230,7 @@ def platform(action, name, values):
     if action == 'remove':
         assert len(values) == 0
         ixmp.config.remove_platform(name)
-        print('Removed platform config for {!r}'.format(name))
+        print(f'Removed platform config for {repr(name)}')
     elif action == 'add':
         ixmp.config.add_platform(name, *values)
 

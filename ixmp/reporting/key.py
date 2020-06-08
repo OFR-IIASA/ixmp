@@ -1,5 +1,5 @@
 from functools import lru_cache, partial
-from itertools import compress
+from itertools import chain, compress
 
 
 class Key:
@@ -17,7 +17,7 @@ class Key:
         ----------
         value : str or Key
             Value to use to generate a new Key.
-        drop : list of str, optional
+        drop : list of str or :obj:`True`, optional
             Existing dimensions of *value* to drop. See :meth:`drop`.
         append : list of str, optional.
             New dimensions to append to the returned Key. See :meth:`append`.
@@ -40,12 +40,12 @@ class Key:
             base = cls(name, dims, _tag)
 
         # Drop and append dimensions; add tag
-        return base.drop(*(base.dims if drop is True else drop)) \
+        return base.drop(*([drop] if drop is True else drop)) \
                    .append(*append) \
                    .add_tag(tag)
 
     @classmethod
-    def product(cls, new_name, *keys):
+    def product(cls, new_name, *keys, tag=None):
         """Return a new Key that has the union of dimensions on *keys*.
 
         Dimensions are ordered by their first appearance:
@@ -60,16 +60,11 @@ class Key:
         new_name : str
             Name for the new Key. The names of *keys* are discarded.
         """
-        # Dimensions of first key appear first
-        base_dims = list(keys[0].dims)
+        # Iterable of dimension names from all keys, in order, with repetitions
+        dims = chain(*[k.dims for k in keys])
 
-        # Accumulate additional dimensions from subsequent keys
-        new_dims = []
-        for key in keys[1:]:
-            new_dims.extend(set(key.dims) - set(base_dims) - set(new_dims))
-
-        # Return new key
-        return cls(new_name, base_dims + new_dims)
+        # Return new key. Use dict to keep only unique *dims*, in same order
+        return cls(new_name, dict.fromkeys(dims).keys()).add_tag(tag)
 
     def __repr__(self):
         """Representation of the Key, e.g. '<name:dim1-dim2-dim3:tag>."""
@@ -120,8 +115,11 @@ class Key:
 
     def drop(self, *dims):
         """Return a new Key with *dims* dropped."""
-        return Key(self.name, filter(lambda d: d not in dims, self.dims),
-                   self.tag)
+        if dims == (True,):
+            new_dims = []
+        else:
+            new_dims = filter(lambda d: d not in dims, self.dims)
+        return Key(self.name, new_dims, self.tag)
 
     def append(self, *dims):
         """Return a new Key with additional dimensions *dims*."""
@@ -137,9 +135,11 @@ class Key:
         from . import computations
 
         for agg_dims, others in combo_partition(self.dims):
-            yield Key(self.name, agg_dims, self.tag), \
-                (partial(computations.sum, dimensions=others, weights=None),
-                 self)
+            yield (
+                Key(self.name, agg_dims, self.tag),
+                partial(computations.sum, dimensions=others, weights=None),
+                self,
+            )
 
 
 def combo_partition(iterable):

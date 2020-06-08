@@ -205,6 +205,40 @@ class Backend(ABC):
         """
 
     @abstractmethod
+    def set_doc(self, domain, docs):
+        """Save documentation to database
+
+        Parameters
+        ----------
+        domain : str
+            Documentation domain, e.g. model, scenario etc
+        docs : dict or array of tuples
+            Dictionary or tuple array containing mapping between name of domain
+            object (e.g. model name) and string representing fragment
+            of documentation
+        """
+
+    @abstractmethod
+    def get_doc(self, domain, name=None):
+        """ Read documentation from database
+
+        Parameters
+        ----------
+        domain : str
+            Documentation domain, e.g. model, scenario etc
+        name : str, optional
+            Name of domain entity (e.g. model name).
+
+        Returns
+        -------
+        str or dict
+            String representing fragment of documentation if name is passed as
+            parameter or dictionary containing mapping between name of domain
+            object (e.g. model name) and string representing fragment when
+            name parameter is omitted.
+        """
+
+    @abstractmethod
     def set_node(self, name, parent=None, hierarchy=None, synonym=None):
         """Add a node name to the Platform.
 
@@ -305,8 +339,9 @@ class Backend(ABC):
 
         The default implementation supports:
 
-        - `path` ending in '.xlsx', `item_type` is ItemType.MODEL: write a
-          single Scenario given by kwargs['filters']['scenario'] to file using
+        - `path` ending in '.xlsx', `item_type` is either :attr:`.MODEL` or
+          :attr:`.SET` | :attr:`.PAR`: write a single Scenario given by
+          kwargs['filters']['scenario'] to file using
           :meth:`pandas.DataFrame.to_excel`.
 
         Parameters
@@ -329,8 +364,9 @@ class Backend(ABC):
         read_file
         """
         s, filters = self._handle_rw_filters(kwargs.pop('filters', {}))
-        if path.suffix == '.xlsx' and item_type is ItemType.MODEL and s:
-            s_write_excel(self, s, path)
+        xlsx_types = (ItemType.SET | ItemType.PAR, ItemType.MODEL)
+        if path.suffix == '.xlsx' and item_type in xlsx_types and s:
+            s_write_excel(self, s, path, item_type, **kwargs)
         else:
             raise NotImplementedError
 
@@ -355,11 +391,14 @@ class Backend(ABC):
     # Methods for ixmp.TimeSeries
 
     @abstractmethod
-    def init_ts(self, ts: TimeSeries, annotation=None):
-        """Initialize the TimeSeries *ts*.
+    def init(self, ts: TimeSeries, annotation):
+        """Create a new TimeSeries (or Scenario) *ts*.
 
-        ts_init **may** modify the :attr:`~TimeSeries.version` attribute of
+        init **may** modify the :attr:`~TimeSeries.version` attribute of
         *ts*.
+
+        If *ts* is a :class:`Scenario`; the Backend **must** store the
+        :attr:`.Scenario.scheme` attribute.
 
         Parameters
         ----------
@@ -370,28 +409,25 @@ class Backend(ABC):
         Returns
         -------
         None
-
-        Raises
-        ------
-        RuntimeError
-            if *ts* is newly created and :meth:`commit` has not been called.
         """
 
     @abstractmethod
-    def get(self, ts: TimeSeries, version):
-        """Retrieve the existing TimeSeries or Scenario *ts*.
+    def get(self, ts: TimeSeries):
+        """Retrieve the existing TimeSeries (or Scenario) *ts*.
 
-        The TimeSeries is identified based on its (:attr:`~.TimeSeries.model`,
-        :attr:`~.TimeSeries.scenario`) and *version*.
+        The TimeSeries is identified based on the unique combination of the
+        attributes of *ts*:
+
+        - :attr:`~.TimeSeries.model`,
+        - :attr:`~.TimeSeries.scenario`, and
+        - :attr:`~.TimeSeries.version`.
+
+        If :attr:`.version` is :obj:`None`, the Backend **must** return the
+        version marked as default, and **must** set the attribute value.
 
         If *ts* is a Scenario, :meth:`get` **must** set the
-        :attr:`~.Scenario.scheme` attribute on it.
-
-        Parameters
-        ----------
-        version : int or None
-            If :obj:`None`, the version marked as the default is returned, and
-            ts_get **must** set :attr:`.TimeSeries.version` attribute on *ts*.
+        :attr:`~.Scenario.scheme` attribute with the value previously passed to
+        :meth:`init`.
 
         Returns
         -------
@@ -405,7 +441,14 @@ class Backend(ABC):
 
         See also
         --------
-        ts_set_as_default
+        is_default
+        set_as_default
+        """
+
+    def del_ts(self, ts: TimeSeries):
+        """OPTIONAL: Free memory associated with the TimeSeries *ts*.
+
+        The default implementation has no effect.
         """
 
     @abstractmethod
@@ -600,9 +643,8 @@ class Backend(ABC):
 
         See also
         --------
-        ts_is_default
-        ts_get
-        s_get
+        get
+        is_default
         """
 
     @abstractmethod
@@ -615,9 +657,8 @@ class Backend(ABC):
 
         See also
         --------
-        ts_set_as_default
-        ts_get
-        s_get
+        get
+        set_as_default
         """
 
     @abstractmethod
@@ -642,25 +683,6 @@ class Backend(ABC):
         """OPTIONAL: Load *ts* data into memory."""
 
     # Methods for ixmp.Scenario
-
-    @abstractmethod
-    def init_s(self, s: Scenario, scheme, annotation):
-        """Initialize the Scenario *s*.
-
-        s_init **may** modify the :attr:`~.TimeSeries.version` attribute of
-        *s*.
-
-        Parameters
-        ----------
-        scheme : str
-            Description of the scheme of the Scenario.
-        annotation : str
-            Description of the Scenario.
-
-        Returns
-        -------
-        None
-        """
 
     @abstractmethod
     def clone(self, s: Scenario, platform_dest, model, scenario, annotation,
@@ -867,12 +889,12 @@ class Backend(ABC):
 
     @abstractmethod
     def get_meta(self, s: Scenario):
-        """Return all metadata.
+        """Return all meta.
 
         Returns
         -------
         dict (str -> any)
-            Mapping from metadata keys to values.
+            Mapping from meta keys to values.
 
         See also
         --------
@@ -880,15 +902,17 @@ class Backend(ABC):
         """
 
     @abstractmethod
-    def set_meta(self, s: Scenario, name, value):
-        """Set a single metadata key.
+    def set_meta(self, s: Scenario, name_or_dict, value=None):
+        """Set single or multiple meta entries.
 
         Parameters
         ----------
-        name : str
-            Metadata key name.
-        value : int or float or bool or str
-            Value for *name*.
+        name_or_dict : str or dict
+            If the argument is dict, it used as a mapping of meta
+            categories (names) to values. Otherwise, use the argument
+            as the meta attribute name.
+        value : str or number or bool, optional
+            Meta attribute value.
 
         Returns
         -------
@@ -898,6 +922,20 @@ class Backend(ABC):
         ------
         TypeError
             If *value* is not a valid type.
+        """
+
+    @abstractmethod
+    def delete_meta(self, s, name):
+        """Remove single or multiple meta entries.
+
+        Parameters
+        ----------
+        name : str or list of str
+            Either single meta key or list of keys.
+
+        Returns
+        -------
+        None
         """
 
     @abstractmethod
@@ -969,6 +1007,9 @@ class Backend(ABC):
 class CachingBackend(Backend):
     """Backend with additional features for caching data."""
 
+    #: :obj:`True` if caching is enabled.
+    cache_enabled = True
+
     #: Cache of values. Keys are given by :meth:`_cache_key`; values depend on
     #: the subclass' usage of the cache.
     _cache = {}
@@ -977,12 +1018,22 @@ class CachingBackend(Backend):
     #: using :meth:`cache_get`.
     _cache_hit = {}
 
-    def __init__(self):
+    # Backend API methods
+
+    def __init__(self, cache_enabled=True):
         super().__init__()
+
+        self.cache_enabled = cache_enabled
 
         # Empty the cache
         self._cache = {}
         self._cache_hit = {}
+
+    def del_ts(self, ts: TimeSeries):
+        """Invalidate cache entries associated with *ts*."""
+        self.cache_invalidate(ts)
+
+    # New methods for CachingBackend
 
     @classmethod
     def _cache_key(self, ts, ix_type, name, filters=None):
@@ -1026,7 +1077,7 @@ class CachingBackend(Backend):
         """
         key = self._cache_key(ts, ix_type, name, filters)
 
-        if key in self._cache:
+        if self.cache_enabled and key in self._cache:
             self._cache_hit[key] = self._cache_hit.setdefault(key, 0) + 1
             return copy(self._cache[key])
         else:
@@ -1041,6 +1092,10 @@ class CachingBackend(Backend):
             :obj:`True` if the key was already in the cache and its value was
             overwritten.
         """
+        if not self.cache_enabled:
+            # Don't store anything if cache is disabled
+            return False
+
         key = self._cache_key(ts, ix_type, name, filters)
 
         refreshed = key in self._cache
