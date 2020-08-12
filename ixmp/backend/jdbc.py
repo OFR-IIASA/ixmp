@@ -1,6 +1,6 @@
 from copy import copy
 from collections import ChainMap
-from collections.abc import Collection, Iterable
+from collections.abc import Iterable, Sequence
 import gc
 from itertools import chain
 import logging
@@ -453,15 +453,23 @@ class JDBCBackend(CachingBackend):
             # GDX
             self.jindex[ts].toGDX(str(path.parent), path.name, False)
         elif path.suffix == '.csv' and item_type is ItemType.TS:
-            model = filters.pop('model')
-            scenario = filters.pop('scenario')
+            models = set(filters.pop('model'))
+            scenarios = set(filters.pop('scenario'))
             variables = filters.pop('variable')
+            units = filters.pop('unit')
+            regions = filters.pop('region')
             default = filters.pop('default')
 
-            scen_list = self.jobj.getScenarioList(default, model, scenario)
-            run_ids = [s['run_id'] for s in scen_list]
+            scen_list = self.jobj.getScenarioList(default, None, None)
+            # TODO: replace with passing list of models/scenarios
+            #       to the method above
+            run_ids = [s['run_id'] for s in scen_list
+                       if (len(scenarios) == 0 or s['scenario'] in scenarios)
+                       and (len(models) == 0 or s['model'] in models)]
             self.jobj.exportTimeseriesData(to_jlist(run_ids),
                                            to_jlist(variables),
+                                           to_jlist(units),
+                                           to_jlist(regions),
                                            str(path))
         else:
             raise NotImplementedError
@@ -823,12 +831,12 @@ class JDBCBackend(CachingBackend):
             result = pd.Series(item.getCol(0, jList), dtype=object)
         elif type == 'par':
             # Scalar parameters
-            result = dict(value=item.getScalarValue().floatValue(),
+            result = dict(value=float(item.getScalarValue().floatValue()),
                           unit=str(item.getScalarUnit()))
         elif type in ('equ', 'var'):
             # Scalar equations and variables
-            result = dict(lvl=item.getScalarLevel().floatValue(),
-                          mrg=item.getScalarMarginal().floatValue())
+            result = dict(lvl=float(item.getScalarLevel().floatValue()),
+                          mrg=float(item.getScalarMarginal().floatValue()))
 
         # Store cache
         self.cache(s, type, name, filters, result)
@@ -1038,7 +1046,7 @@ def to_jlist(arg, convert=None):
 
     Parameters
     ----------
-    arg : Collection or Iterable
+    arg : Collection or Iterable or str
     convert : callable, optional
         If supplied, every element of *arg* is passed through `convert` before
         being added.
@@ -1049,12 +1057,19 @@ def to_jlist(arg, convert=None):
     """
     jlist = java.LinkedList()
 
+    # Previously JPype1 (prior to 1.0) could take single argument
+    # in addAll method of Java collection. As string implements Sequence
+    # contract in Python we need to convert it explicitly to list here.
+    if isinstance(arg, str):
+        arg = [arg]
+
     if convert:
         arg = map(convert, arg)
 
-    if isinstance(arg, Collection):
+    if isinstance(arg, Sequence):
         # Sized collection can be used directly
         jlist.addAll(arg)
+
     elif isinstance(arg, Iterable):
         # Transfer items from an iterable, generator, etc. to the LinkedList
         [jlist.add(value) for value in arg]

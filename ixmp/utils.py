@@ -340,10 +340,11 @@ def show_versions(file=sys.stdout):
 
     def _git_log(mod):
         cmd = ['git', 'log', '--oneline', '--no-color', '--decorate', '-n 1']
-        cwd = Path(mod.__file__).parent
         try:
+            cwd = Path(mod.__file__).parent
             info = check_output(cmd, cwd=cwd, encoding='utf-8', stderr=DEVNULL)
         except Exception:
+            # Occurs if "git log" fails; or if mod.__file__ is None (#338)
             return ''
         else:
             return f'\n     {info.rstrip()}'
@@ -382,6 +383,9 @@ def show_versions(file=sys.stdout):
             version = 'installed'
         finally:
             info.append((module_name, version + gl))
+
+        if module_name == 'jpype':
+            info.append(('… JVM path', mod.getDefaultJVMPath()))
 
     # Use xarray to get system & Python information
     info.extend(get_sys_info()[1:])  # Exclude the commit number
