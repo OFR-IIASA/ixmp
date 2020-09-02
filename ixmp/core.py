@@ -57,10 +57,17 @@ class Platform:
 
     # List of method names which are handled directly by the backend
     _backend_direct = [
-        'open_db',
+        'add_model_name',
+        'add_scenario_name',
         'close_db',
         'get_doc',
+        'get_meta',
+        'get_model_names',
+        'get_scenario_names',
+        'open_db',
+        'remove_meta',
         'set_doc',
+        'set_meta',
     ]
 
     def __init__(self, name=None, backend=None, **backend_args):
@@ -439,9 +446,9 @@ class TimeSeries:
         elif version and not (version == 'new' or isinstance(version, int)):
             raise ValueError(f'version={repr(version)}')
         elif version == 'new' and annotation is None:
-            log.warning(
-                f'Missing annotation for new {self.__class__.__name__}'
-                f' {model}/{scenario}'
+            log.info(
+                f"Missing annotation for new {self.__class__.__name__}"
+                f" {model}/{scenario}"
             )
             annotation = ''
 
@@ -1173,7 +1180,49 @@ class Scenario(TimeSeries):
             Index names mapped to lists of index set elements. Elements not
             appearing in the respective index set(s) are silently ignored.
         """
+        if len(kwargs):
+            raise DeprecationWarning(
+                "ignored kwargs to Scenario.par(); will raise TypeError in 4.0"
+            )
         return self._backend('item_get_elements', 'par', name, filters)
+
+    def items(self, type=ItemType.PAR, filters=None):
+        """Iterate over model data items.
+
+        Parameters
+        ----------
+        type : ItemType, optional
+            Types of items to iterate, e.g. :data:`ItemType.PAR` for
+            parameters, the only value currently supported.
+        filters : dict, optional
+            Filters for values along dimensions; same as the `filters` argument
+            to :meth:`par`.
+
+        Yields
+        ------
+        (str, object)
+            Tuples of item name and data.
+        """
+        if type != ItemType.PAR:
+            raise NotImplementedError(
+                f"Scenario.items(type={type}); only ItemType.PAR is supported"
+            )
+
+        filters = filters or dict()
+
+        names = sorted(self.par_list())
+
+        for name in sorted(names):
+            idx_names = set(self.idx_names(name))
+            if len(filters) and not set(filters.keys()) & idx_names:
+                # No overlap between the filters and this item's dimensions
+                continue
+
+            # Retrieve the data, reducing the filters to only the dimensions of
+            # the item
+            yield name, self.par(name, filters={
+                k: v for k, v in filters.items() if k in idx_names
+            })
 
     def add_par(self, name, key_or_data=None, value=None, unit=None,
                 comment=None):
@@ -1584,9 +1633,10 @@ class Scenario(TimeSeries):
         Parameters
         ----------
         name : str, optional
-            meta attribute name
+            meta category name
         """
-        all_meta = self._backend('get_meta')
+        all_meta = self.platform._backend.get_meta(self.model, self.scenario,
+                                                   self.version)
         return all_meta[name] if name else all_meta
 
     def set_meta(self, name_or_dict, value=None):
@@ -1597,26 +1647,57 @@ class Scenario(TimeSeries):
         name_or_dict : str or dict
             If the argument is dict, it used as a mapping of meta
             categories (names) to values. Otherwise, use the argument
-            as the meta attribute name.
+            as the meta category name.
         value : str or number or bool, optional
-            Meta attribute value.
+            Meta category value.
         """
-        if type(name_or_dict) == dict:
-            name_or_dict = list(name_or_dict.items())
-        self._backend('set_meta', name_or_dict, value)
+        if not isinstance(name_or_dict, dict):
+            if isinstance(name_or_dict, str):
+                name_or_dict = {name_or_dict: value}
+            else:
+                msg = ('Unsupported parameter type of name_or_dict: %s. '
+                       'Supported parameter types for name_or_dict are '
+                       'String and Dictionary') % type(name_or_dict)
+                raise ValueError(msg)
+        self.platform._backend.set_meta(name_or_dict, self.model,
+                                        self.scenario, self.version)
 
-    def delete_meta(self, name):
-        """Delete scenario meta.
+    def delete_meta(self, *args, **kwargs):
+        """Remove scenario meta.
+
+        .. deprecated:: 3.1
+
+           Use :meth:`remove_meta()`.
 
         Parameters
         ----------
         name : str or list of str
             Either single meta key or list of keys.
         """
-        self._backend('delete_meta', name)
+        warn("Scenario.delete_meta(); use remove_meta()", DeprecationWarning)
+        self.remove_meta(*args, **kwargs)
+
+    def remove_meta(self, name):
+        """Remove scenario meta.
+
+        Parameters
+        ----------
+        name : str or list of str
+            Either single meta key or list of keys.
+        """
+        if isinstance(name, str):
+            name = [name]
+        self.platform._backend.remove_meta(name, self.model, self.scenario,
+                                           self.version)
 
     # Input and output
-    def to_excel(self, path, items=ItemType.SET | ItemType.PAR, max_row=None):
+    def to_excel(
+        self,
+        path,
+        items=ItemType.SET | ItemType.PAR,
+        filters=None,
+        max_row=None
+    ):
         """Write Scenario to a Microsoft Excel file.
 
         Parameters
@@ -1627,6 +1708,9 @@ class Scenario(TimeSeries):
             Types of items to write. Either :attr:`.SET` | :attr:`.PAR` (i.e.
             only sets and parameters), or :attr:`.MODEL` (also variables and
             equations, i.e. model solution data).
+        filters : dict, optional
+            Filters for values along dimensions; same as the `filters` argument
+            to :meth:`par`.
         max_row: int, optional
             Maximum number of rows in each sheet. If the number of elements in
             an item exceeds this number or :data:`.EXCEL_MAX_ROWS`, then an
@@ -1638,9 +1722,16 @@ class Scenario(TimeSeries):
         :ref:`excel-data-format`
         read_excel
         """
-        self.platform._backend.write_file(Path(path), items,
-                                          filters=dict(scenario=self),
-                                          max_row=max_row)
+        # Default filters: empty dict
+        filters = filters or dict()
+
+        # Select the current scenario
+        filters["scenario"] = self
+
+        # Invoke the backend method
+        self.platform._backend.write_file(
+            Path(path), items, filters=filters, max_row=max_row
+        )
 
     def read_excel(self, path, add_units=False, init_items=False,
                    commit_steps=False):

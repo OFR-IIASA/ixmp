@@ -20,8 +20,20 @@ jobs:
         - ubuntu-latest
         - windows-latest
         python-version:
-        - '3.6' # Earliest supported by ixmp
-        - '3.8' # Latest available
+        - '3.6'        # Earliest supported by ixmp
+        - '3.8'        # Latest release
+        # Currently disabled: compiled binary packages are not available for
+        # some dependencies, e.g. llvmlite, numpy, pandas. Compiling these on
+        # the job runner requires a more elaborate build environment, currently
+        # out of scope.
+        # TODO enable once Python 3.9 is released and binary packages are
+        #      availalable.
+        # - '3.9.0-rc.1' # Development version
+
+        exclude:
+        # See https://github.com/iiasa/ixmp/issues/360
+        - os: windows-latest
+          python-version: '3.6'
 
       fail-fast: false
 
@@ -37,6 +49,9 @@ jobs:
       run: git fetch --tags --depth=${{ env.depth }}
 
     - uses: actions/setup-python@v2
+      with:
+        python-version: ${{ matrix.python-version }}
+
     - uses: r-lib/actions/setup-r@master
 
     - name: Use OpenJDK 14 (macOS only)
@@ -89,7 +104,7 @@ jobs:
       run: |
         install.packages("remotes")
         remotes::install_cran(c("rcmdcheck", "IRkernel"))
-        remotes::install_deps("rixmp", dependencies = TRUE)
+        remotes::install_deps("rixmp", upgrade = "never", dependencies = TRUE)
 
         # commented: for debugging
         # print(reticulate::py_config())
@@ -98,7 +113,11 @@ jobs:
         # For R tutorial notebooks, run via the pytest suite: set up R kernel;
         # actually install the R package
         IRkernel::installspec()
-        remotes::install_local("rixmp", INSTALL_opts = c("--no-multiarch"))
+        remotes::install_local(
+          "rixmp",
+          force = TRUE,
+          INSTALL_opts = c("--no-multiarch"),
+          )
       shell: Rscript {0}
 
     - name: Run test suite using pytest

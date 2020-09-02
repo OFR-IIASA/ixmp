@@ -1,6 +1,7 @@
 from copy import copy
 from collections import ChainMap
 from collections.abc import Iterable, Sequence
+from typing import Generator
 import gc
 from itertools import chain
 import logging
@@ -18,7 +19,6 @@ from ixmp.core import Scenario
 from ixmp.utils import as_str_list, filtered
 from . import FIELDS, ItemType
 from .base import CachingBackend
-
 
 log = logging.getLogger(__name__)
 
@@ -53,12 +53,14 @@ JAVA_CLASSES = [
     'java.lang.Integer',
     'java.lang.NoClassDefFoundError',
     'java.lang.IllegalArgumentException',
+    'java.lang.Long',
     'java.lang.Runtime',
     'java.lang.System',
     'java.math.BigDecimal',
     'java.util.HashMap',
     'java.util.LinkedHashMap',
     'java.util.LinkedList',
+    'java.util.ArrayList',
     'java.util.Properties',
     'at.ac.iiasa.ixmp.dto.DocumentationKey',
 ]
@@ -140,6 +142,28 @@ def _domain_enum(domain):
         domains = ', '.join([d.name().lower() for d in domain_enum.values()])
         raise ValueError(f'No such domain: {domain}, '
                          f'existing domains: {domains}')
+
+
+def _unwrap(v):
+    """Unwrap meta numeric value or list of values (BigDecimal -> Double)."""
+    if isinstance(v, java.BigDecimal):
+        return v.doubleValue()
+    if isinstance(v, java.ArrayList):
+        return [_unwrap(elt) for elt in v]
+    return v
+
+
+def _wrap(value):
+    if isinstance(value, (str, bool)):
+        return value
+    if isinstance(value, (int, float)):
+        return java.BigDecimal(value)
+    elif isinstance(value, (Sequence, Iterable)):
+        jlist = java.ArrayList()
+        jlist.addAll([_wrap(elt) for elt in value])
+        return jlist
+    else:
+        raise ValueError(f'Cannot use value {value} as metadata')
 
 
 class JDBCBackend(CachingBackend):
@@ -240,16 +264,37 @@ class JDBCBackend(CachingBackend):
         except jpype.JException as e:  # pragma: no cover
             # Handle Java exceptions
             jclass = e.__class__.__name__
-            if jclass.endswith('HikariPool.PoolInitializationException'):
+            if jclass.endswith("HikariPool.PoolInitializationException"):
                 redacted = copy(kwargs)
-                redacted.update({'user': '(HIDDEN)', 'password': '(HIDDEN)'})
-                msg = f'unable to connect to database:\n{repr(redacted)}'
-            elif jclass.endswith('FlywayException'):
-                msg = 'when initializing database:'
-            _raise_jexception(e, f'{msg}\n(Java: {jclass})')
+                redacted.update({"user": "(HIDDEN)", "password": "(HIDDEN)"})
+                msg = f"unable to connect to database:\n{repr(redacted)}"
+            elif jclass.endswith("FlywayException"):
+                msg = "when initializing database:"
+                if "applied migration" in e.args[0]:
+                    msg += (
+                        "\n\nThe schema of the database does not match the "
+                        "schema of this version of ixmp. To resolve, either "
+                        "install the version of ixmp used to create the "
+                        "database, or delete it and retry."
+                    )
+            else:
+                _raise_jexception(e)
+            raise RuntimeError(f"{msg}\n(Java: {jclass})")
 
         # Set the log level
         self.set_log_level(log_level)
+
+    def __del__(self):
+        self.close_db()
+
+    @classmethod
+    def gc(cls):
+        if _GC_AGGRESSIVE:
+            # log.debug('Collect garbage')
+            java.System.gc()
+            gc.collect()
+        # else:
+        #     log.debug('Skip garbage collection')
 
     # Platform methods
 
@@ -298,12 +343,8 @@ class JDBCBackend(CachingBackend):
         """
         try:
             self.jobj.closeDB()
-        except java.IxException as e:
-            if 'Error closing the database connection!' in str(e):
-                log.warning('Database connection could not be closed or was '
-                            'already closed')
-            else:
-                log.warning(str(e))
+        except java.IxException as e:  # pragma: no cover
+            log.warning(str(e))
         except AttributeError:
             pass  # self.jobj is None, e.g. cleanup after __init__ fails
 
@@ -330,6 +371,20 @@ class JDBCBackend(CachingBackend):
 
     def set_timeslice(self, name, category, duration):
         self.jobj.addTimeslice(name, category, java.Double(duration))
+
+    def add_model_name(self, name):
+        self.jobj.addModel(str(name))
+
+    def add_scenario_name(self, name):
+        self.jobj.addScenario(str(name))
+
+    def get_model_names(self) -> Generator[str, None, None]:
+        for model in self.jobj.listModels():
+            yield str(model)
+
+    def get_scenario_names(self) -> Generator[str, None, None]:
+        for scenario in self.jobj.listScenarios():
+            yield str(scenario)
 
     def get_scenarios(self, default, model, scenario):
         # List<Map<String, Object>>
@@ -503,6 +558,22 @@ class JDBCBackend(CachingBackend):
 
             ts.scheme = s
 
+    def _validate_meta_args(self, model, scenario, version):
+        """Validate arguments for getting/setting/deleting meta"""
+        valid = False
+        if model and not scenario and version is None:
+            valid = True
+        elif scenario and not model and version is None:
+            valid = True
+        elif model and scenario and version is None:
+            valid = True
+        elif model and scenario and version is not None:
+            valid = True
+        if not valid:
+            msg = ('Invalid arguments. Valid combinations are: (model), '
+                   '(scenario), (model, scenario), (model, scenario, version)')
+            raise ValueError(msg)
+
     def init(self, ts, annotation):
         klass = ts.__class__.__name__
 
@@ -555,7 +626,10 @@ class JDBCBackend(CachingBackend):
         try:
             self.jindex[ts].commit(comment)
         except java.IxException as e:
-            _raise_jexception(e)
+            if "this Scenario is not checked out" in e.args[0]:
+                raise RuntimeError(e.args[0])
+            else:  # pragma: no cover
+                _raise_jexception(e)
         if ts.version == 0:
             ts.version = self.jindex[ts].getVersion()
 
@@ -667,6 +741,7 @@ class JDBCBackend(CachingBackend):
         self.jindex[ts].removeGeoData(region, variable, subannual, years, unit)
 
     # Scenario methods
+
     def clone(self, s, platform_dest, model, scenario, annotation,
               keep_solution, first_model_year=None):
         # Raise exceptions for limitations of JDBCBackend
@@ -863,10 +938,14 @@ class JDBCBackend(CachingBackend):
                 # - par: (value, unit, comment)
                 jobj.addElement(*args)
         except java.IxException as e:
-            msg = e.message()
-            if ('does not have an element' in msg) or ('The unit' in msg):
+            if any(
+                s in e.args[0] for s in
+                ("does not have an element", "The unit")
+            ):
                 # Re-raise as Python ValueError
-                raise ValueError(msg) from None
+                raise ValueError(e.args[0]) from None
+            elif "cannot be edited" in e.args[0]:
+                raise RuntimeError(e.args[0])
             else:  # pragma: no cover
                 _raise_jexception(e)
 
@@ -883,38 +962,33 @@ class JDBCBackend(CachingBackend):
         args = (s,) if type == 'set' else (s, type, name)
         self.cache_invalidate(*args)
 
-    def get_meta(self, s):
-        def unwrap(v):
-            """Unwrap meta numeric value (BigDecimal -> Double)"""
-            return v.doubleValue() if isinstance(v, java.BigDecimal) else v
+    def get_meta(self, model: str = None, scenario: str = None,
+                 version: int = None, strict: bool = False) -> dict:
+        self._validate_meta_args(model, scenario, version)
+        if version is not None:
+            version = java.Long(version)
+        meta = self.jobj.getMeta(model, scenario, version, strict)
+        return {entry.getKey(): _unwrap(entry.getValue())
+                for entry in meta.entrySet()}
 
-        return {entry.getKey(): unwrap(entry.getValue())
-                for entry in self.jindex[s].getMeta().entrySet()}
+    def set_meta(self, meta: dict, model: str = None, scenario: str = None,
+                 version: int = None) -> None:
+        self._validate_meta_args(model, scenario, version)
+        if version is not None:
+            version = java.Long(version)
 
-    def set_meta(self, s, name_or_dict, value=None):
-        if type(name_or_dict) == list:
-            jdata = java.LinkedHashMap()
-            for k, v in name_or_dict:
-                jdata.put(str(k), v)
-            self.jindex[s].setMeta(jdata)
-            return
+        jmeta = java.HashMap()
+        for k, v in meta.items():
+            jmeta.put(str(k), _wrap(v))
+        self.jobj.setMeta(model, scenario, version, jmeta)
 
-        _type = type(value)
-        try:
-            _type = {int: 'Num', float: 'Num', str: 'Str', bool: 'Bool'}[_type]
-            method_name = 'setMeta' + _type
-        except KeyError:
-            raise TypeError(f'Cannot store meta of type {_type}')
-
-        getattr(self.jindex[s], method_name)(name_or_dict, value)
-
-    def delete_meta(self, s, name):
-        if type(name) == str:
-            name = [name]
-        jdata = java.LinkedList()
-        for k in name:
-            jdata.add(str(k))
-        self.jindex[s].removeMeta(jdata)
+    def remove_meta(self, categories, model: str = None, scenario: str = None,
+                    version: int = None):
+        self._validate_meta_args(model, scenario, version)
+        if version is not None:
+            version = java.Long(version)
+        return self.jobj.removeMeta(model, scenario, version,
+                                    to_jlist(categories))
 
     def clear_solution(self, s, from_year=None):
         from ixmp.core import Scenario
@@ -966,18 +1040,6 @@ class JDBCBackend(CachingBackend):
                 raise KeyError(name) from None
             else:  # pragma: no cover
                 _raise_jexception(e)
-
-    def __del__(self):
-        self.close_db()
-
-    @classmethod
-    def gc(cls):
-        if _GC_AGGRESSIVE:
-            # log.debug('Collect garbage')
-            java.System.gc()
-            gc.collect()
-        # else:
-        #     log.debug('Skip garbage collection')
 
 
 def start_jvm(jvmargs=None):

@@ -25,10 +25,19 @@ Provided backends
 .. autoclass:: ixmp.backend.jdbc.JDBCBackend
    :members: read_file, write_file
 
-   JDBCBackend supports:
+   JDBCBackend **supports**:
 
    - Databases in local files (HyperSQL) using ``driver='hsqldb'`` and the *path* argument.
    - Remote, Oracle databases using ``driver='oracle'`` and the *url*, *username* and *password* arguments.
+   - Temporary, in-memory databases using ``driver='hsqldb'`` and the *url* argument.
+     Use the `url` parameter with the format ``jdbc:hsqldb:mem:[NAME]``, where [NAME] is any string::
+
+       mp = ixmp.Platform(
+           backend="jdbc",
+           driver="hsqldb",
+           url="jdbc:hsqldb:mem:temporary platform",
+       )
+
 
    JDBCBackend caches values in memory to improve performance when repeatedly reading data from the same items with :meth:`.par`, :meth:`.equ`, or :meth:`.var`.
 
@@ -41,9 +50,16 @@ Provided backends
 
    .. tip:: Modifying an item by adding or deleting elements invalidates its cache.
 
-   JDBCBackend has the following limitations:
+   JDBCBackend has the following **limitations**:
 
    - The `comment` argument to :meth:`Platform.add_unit` is limited to 64 characters.
+
+   JDBCBackend's implementation allows the following kinds of file input and output:
+
+   .. autosummary::
+
+      read_file
+      write_file
 
 .. automethod:: ixmp.backend.jdbc.start_jvm
 
@@ -93,17 +109,24 @@ Backend API
    .. autosummary::
       :nosignatures:
 
+      add_model_name
+      add_scenario_name
       close_db
       get_auth
       get_doc
       get_log_level
+      get_meta
+      get_model_names
       get_nodes
       get_scenarios
+      get_scenario_names
       get_units
       open_db
       read_file
+      remove_meta
       set_doc
       set_log_level
+      set_meta
       set_node
       set_unit
       write_file
@@ -150,6 +173,7 @@ Backend API
       item_set_elements
       item_index
       list_items
+      remove_meta
       set_meta
 
    Methods related to :class:`message_ix.Scenario`:
